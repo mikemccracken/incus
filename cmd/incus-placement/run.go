@@ -46,7 +46,9 @@ func (c *cmdRun) command() *cobra.Command {
   queries answered from the snapshot rather than from a live cluster.
 
   When no scriptlet is passed, the one captured with the cluster is used.
-  If there is none, the built-in placement logic is shown instead.
+  If there is none, the built-in placement logic is shown instead, which
+  picks the candidate with the fewest instances (across all projects),
+  regardless of CPU or memory usage.
 `
 
 	cmd.PersistentFlags().StringVarP(&c.flagCluster, "cluster", "c", "cluster.yaml", "Cluster snapshot file")
@@ -91,7 +93,7 @@ func (c *cmdRun) simulator() (*simulator, error) {
 	} else if src != "" {
 		fmt.Fprintln(os.Stderr, "Using the scriptlet captured with the cluster")
 	} else {
-		fmt.Fprintln(os.Stderr, "No scriptlet provided, showing the built-in placement")
+		fmt.Fprintln(os.Stderr, "No scriptlet provided, showing the built-in placement (candidate with the fewest instances)")
 	}
 
 	return newSimulator(snap, src, c.flagLocalMember)
@@ -138,6 +140,15 @@ func (c *cmdRun) execute(action func(sim *simulator) ([]*result, error)) error {
 	return printReport(os.Stdout, sim, rep)
 }
 
+// instancesLabel formats an instance count.
+func instancesLabel(count int) string {
+	if count == 1 {
+		return "1 instance"
+	}
+
+	return fmt.Sprintf("%d instances", count)
+}
+
 // printReport writes a human readable report.
 func printReport(w io.Writer, sim *simulator, rep report) error {
 	for _, res := range rep.Results {
@@ -149,7 +160,21 @@ func printReport(w io.Writer, sim *simulator, rep report) error {
 		_, _ = fmt.Fprintln(w, header)
 
 		if res.Candidates != nil {
-			_, _ = fmt.Fprintf(w, "  candidates: %s\n", strings.Join(res.Candidates, ", "))
+			entries := make([]string, 0, len(res.Candidates))
+			for _, name := range res.Candidates {
+				entries = append(entries, fmt.Sprintf("%s (%s)", name, instancesLabel(res.InstanceCounts[name])))
+			}
+
+			_, _ = fmt.Fprintf(w, "  candidates: %s\n", strings.Join(entries, ", "))
+		}
+
+		for i, entry := range res.Excluded {
+			label := "excluded:"
+			if i > 0 {
+				label = ""
+			}
+
+			_, _ = fmt.Fprintf(w, "  %-11s %s (%s)\n", label, entry.Member, entry.Reason)
 		}
 
 		for _, entry := range res.Trace {
@@ -231,7 +256,7 @@ func (c *cmdRunCreate) command() *cobra.Command {
 	cmd.Args = cobra.NoArgs
 	cmd.RunE = c.runE
 
-	cmd.Flags().StringVar(&c.flagProject, "project", api.ProjectDefaultName, "Project of the instance")
+	cmd.Flags().StringVar(&c.flagProject, "project", "", "Project of the instance (defaults to the only project in the snapshot or \"default\")")
 	cmd.Flags().StringVar(&c.flagName, "name", "new-instance", "Name of the instance")
 	cmd.Flags().StringVar(&c.flagType, "type", string(api.InstanceTypeContainer), "Instance type (container or virtual-machine)")
 	cmd.Flags().StringArrayVarP(&c.flagProfiles, "profile", "p", nil, "Profile to apply to the instance (defaults to \"default\")")
@@ -293,6 +318,8 @@ func (c *cmdRunCreate) runE(cmd *cobra.Command, args []string) error {
 	}
 
 	return c.run.execute(func(sim *simulator) ([]*result, error) {
+		opts.Project = sim.defaultProject(opts.Project)
+
 		res, err := sim.create(cmd.Context(), opts)
 		if err != nil {
 			return nil, err
@@ -324,7 +351,7 @@ func (c *cmdRunMove) command() *cobra.Command {
 	cmd.Args = cobra.ExactArgs(1)
 	cmd.RunE = c.runE
 
-	cmd.Flags().StringVar(&c.flagProject, "project", api.ProjectDefaultName, "Project of the instance")
+	cmd.Flags().StringVar(&c.flagProject, "project", "", "Project of the instance (defaults to the only project in the snapshot or \"default\")")
 	cmd.Flags().StringVar(&c.flagTarget, "target", "", "Cluster member or @group to move the instance to")
 
 	return cmd
@@ -332,7 +359,7 @@ func (c *cmdRunMove) command() *cobra.Command {
 
 func (c *cmdRunMove) runE(cmd *cobra.Command, args []string) error {
 	return c.run.execute(func(sim *simulator) ([]*result, error) {
-		res, err := sim.move(cmd.Context(), c.flagProject, args[0], c.flagTarget)
+		res, err := sim.move(cmd.Context(), sim.defaultProject(c.flagProject), args[0], c.flagTarget)
 		if err != nil {
 			return nil, err
 		}
