@@ -38,6 +38,7 @@ func TestCreate(t *testing.T) {
 	res, err := testSimulator(t, "").create(context.Background(), opts)
 	require.NoError(t, err)
 	require.Equal(t, []string{"node3", "node2", "node1"}, res.Candidates)
+	require.Equal(t, []exclusion{{Member: "node4", Reason: "scheduler.instance=group and no cluster group was targeted"}}, res.Excluded)
 	require.Equal(t, outcomeBuiltin, res.Outcome)
 	require.Equal(t, "node3", res.Target)
 

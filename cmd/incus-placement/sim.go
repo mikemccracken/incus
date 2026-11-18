@@ -45,19 +45,27 @@ type traceEntry struct {
 	Message string `json:"message" yaml:"message"`
 }
 
+// exclusion records why a cluster member wasn't a placement candidate.
+type exclusion struct {
+	Member string `json:"member" yaml:"member"`
+	Reason string `json:"reason" yaml:"reason"`
+}
+
 // result describes what happened to a single instance placement.
 type result struct {
-	Reason     string       `json:"reason" yaml:"reason"`
-	Project    string       `json:"project" yaml:"project"`
-	Instance   string       `json:"instance" yaml:"instance"`
-	Source     string       `json:"source,omitempty" yaml:"source,omitempty"`
-	Candidates []string     `json:"candidates" yaml:"candidates"`
-	Outcome    string       `json:"outcome" yaml:"outcome"`
-	Target     string       `json:"target,omitempty" yaml:"target,omitempty"`
-	Detail     string       `json:"detail,omitempty" yaml:"detail,omitempty"`
-	Error      string       `json:"error,omitempty" yaml:"error,omitempty"`
-	Trace      []traceEntry `json:"trace,omitempty" yaml:"trace,omitempty"`
-	Duration   string       `json:"duration,omitempty" yaml:"duration,omitempty"`
+	Reason         string         `json:"reason" yaml:"reason"`
+	Project        string         `json:"project" yaml:"project"`
+	Instance       string         `json:"instance" yaml:"instance"`
+	Source         string         `json:"source,omitempty" yaml:"source,omitempty"`
+	Candidates     []string       `json:"candidates" yaml:"candidates"`
+	InstanceCounts map[string]int `json:"instance_counts,omitempty" yaml:"instance_counts,omitempty"`
+	Excluded       []exclusion    `json:"excluded,omitempty" yaml:"excluded,omitempty"`
+	Outcome        string         `json:"outcome" yaml:"outcome"`
+	Target         string         `json:"target,omitempty" yaml:"target,omitempty"`
+	Detail         string         `json:"detail,omitempty" yaml:"detail,omitempty"`
+	Error          string         `json:"error,omitempty" yaml:"error,omitempty"`
+	Trace          []traceEntry   `json:"trace,omitempty" yaml:"trace,omitempty"`
+	Duration       string         `json:"duration,omitempty" yaml:"duration,omitempty"`
 }
 
 // recorder is a logger which records the scriptlet messages in a result.
@@ -164,7 +172,25 @@ func (s *simulator) project(name string) (*api.Project, error) {
 		}
 	}
 
-	return nil, fmt.Errorf("Project %q not found", name)
+	names := make([]string, 0, len(s.snap.Projects))
+	for _, p := range s.snap.Projects {
+		names = append(names, p.Name)
+	}
+
+	return nil, fmt.Errorf("Project %q not found, snapshot has: %s", name, strings.Join(names, ", "))
+}
+
+// defaultProject picks the project to use when none was requested.
+func (s *simulator) defaultProject(name string) string {
+	if name != "" {
+		return name
+	}
+
+	if len(s.snap.Projects) == 1 {
+		return s.snap.Projects[0].Name
+	}
+
+	return api.ProjectDefaultName
 }
 
 // instance returns the named instance.
@@ -244,74 +270,110 @@ func isSchedulable(member *SnapshotMember) bool {
 	return member.Status == "Online" || member.Status == "Blocked"
 }
 
-// candidates mirrors db.GetCandidateMembers.
-func (s *simulator) candidates(architectures []int, group string, allowedGroups []string) ([]*api.ClusterMember, error) {
+// architectureNames returns a readable list of architectures.
+func architectureNames(architectures []int) string {
+	names := make([]string, 0, len(architectures))
+	for _, arch := range architectures {
+		name, err := osarch.ArchitectureName(arch)
+		if err != nil {
+			name = strconv.Itoa(arch)
+		}
+
+		names = append(names, name)
+	}
+
+	return strings.Join(names, " or ")
+}
+
+// exclusionReason mirrors the member filter of db.GetCandidateMembers, returning "" for candidates.
+func (s *simulator) exclusionReason(member *SnapshotMember, architectures []int, group string, allowedGroups []string) (string, error) {
+	// Skip pending, evacuated or offline members.
+	if !isSchedulable(member) {
+		return "status is " + member.Status, nil
+	}
+
+	// Skip manually targeted members.
+	if member.Config["scheduler.instance"] == "manual" {
+		return "scheduler.instance=manual", nil
+	}
+
+	// Skip group-only members if targeted cluster group doesn't match.
+	if member.Config["scheduler.instance"] == "group" && !slices.Contains(member.Groups, group) {
+		if group == "" {
+			return "scheduler.instance=group and no cluster group was targeted", nil
+		}
+
+		return fmt.Sprintf("scheduler.instance=group and not in cluster group %q", group), nil
+	}
+
+	// Skip if a group is requested and member isn't part of it.
+	if group != "" && !slices.Contains(member.Groups, group) {
+		return fmt.Sprintf("not in cluster group %q", group), nil
+	}
+
+	// Skip if working with a restricted set of cluster groups and member isn't part of any.
+	if allowedGroups != nil {
+		found := false
+		for _, allowedGroup := range allowedGroups {
+			if !s.groupExists(allowedGroup) {
+				return "", fmt.Errorf("Cluster group %q doesn't exist", allowedGroup)
+			}
+
+			if slices.Contains(member.Groups, allowedGroup) {
+				found = true
+				break
+			}
+		}
+
+		if !found {
+			return "not in a cluster group allowed by the project (" + strings.Join(allowedGroups, ", ") + ")", nil
+		}
+	}
+
+	// Consider target architectures if specified.
+	if architectures != nil {
+		memberArch, err := osarch.ArchitectureID(member.Architecture)
+		if err != nil {
+			return "", err
+		}
+
+		personalities, err := osarch.ArchitecturePersonalities(memberArch)
+		if err != nil {
+			return "", err
+		}
+
+		supported := append([]int{memberArch}, personalities...)
+		for _, arch := range supported {
+			if slices.Contains(architectures, arch) {
+				return "", nil
+			}
+		}
+
+		return fmt.Sprintf("architecture is %s, instance needs %s", member.Architecture, architectureNames(architectures)), nil
+	}
+
+	return "", nil
+}
+
+// candidates mirrors db.GetCandidateMembers and also reports why the other members were left out.
+func (s *simulator) candidates(architectures []int, group string, allowedGroups []string) ([]*api.ClusterMember, []exclusion, error) {
 	var candidateMembers []*api.ClusterMember
+	var excluded []exclusion
 
 	for i := range s.snap.Members {
 		member := &s.snap.Members[i]
 
-		// Skip pending, evacuated or offline members.
-		if !isSchedulable(member) {
+		reason, err := s.exclusionReason(member, architectures, group, allowedGroups)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		if reason != "" {
+			excluded = append(excluded, exclusion{Member: member.ServerName, Reason: reason})
 			continue
 		}
 
-		// Skip manually targeted members.
-		if member.Config["scheduler.instance"] == "manual" {
-			continue
-		}
-
-		// Skip group-only members if targeted cluster group doesn't match.
-		if member.Config["scheduler.instance"] == "group" && !slices.Contains(member.Groups, group) {
-			continue
-		}
-
-		// Skip if a group is requested and member isn't part of it.
-		if group != "" && !slices.Contains(member.Groups, group) {
-			continue
-		}
-
-		// Skip if working with a restricted set of cluster groups and member isn't part of any.
-		if allowedGroups != nil {
-			found := false
-			for _, allowedGroup := range allowedGroups {
-				if !s.groupExists(allowedGroup) {
-					return nil, fmt.Errorf("Cluster group %q doesn't exist", allowedGroup)
-				}
-
-				if slices.Contains(member.Groups, allowedGroup) {
-					found = true
-					break
-				}
-			}
-
-			if !found {
-				continue
-			}
-		}
-
-		// Consider target architectures if specified.
-		if architectures != nil {
-			memberArch, err := osarch.ArchitectureID(member.Architecture)
-			if err != nil {
-				return nil, err
-			}
-
-			personalities, err := osarch.ArchitecturePersonalities(memberArch)
-			if err != nil {
-				return nil, err
-			}
-
-			supported := append([]int{memberArch}, personalities...)
-			for _, arch := range supported {
-				if slices.Contains(architectures, arch) {
-					candidateMembers = append(candidateMembers, &member.ClusterMember)
-					break
-				}
-			}
-		} else {
-			candidateMembers = append(candidateMembers, &member.ClusterMember)
-		}
+		candidateMembers = append(candidateMembers, &member.ClusterMember)
 	}
 
 	// Sort by instance count using the same (unstable) sort as the daemon.
@@ -319,7 +381,7 @@ func (s *simulator) candidates(architectures []int, group string, allowedGroups 
 		return s.instancesCount("", candidateMembers[i].ServerName) < s.instancesCount("", candidateMembers[j].ServerName)
 	})
 
-	return candidateMembers, nil
+	return candidateMembers, excluded, nil
 }
 
 // checkTarget mirrors project.CheckTarget (without the authorization check).
@@ -438,7 +500,9 @@ func (p *simProvider) InstancesCount(_ context.Context, projectName string, loca
 func (p *simProvider) ClusterMembers(_ context.Context, group string) ([]*api.ClusterMember, error) {
 	p.call("get_cluster_members(group=%q)", group)
 
-	return p.sim.candidates(nil, group, nil)
+	members, _, err := p.sim.candidates(nil, group, nil)
+
+	return members, err
 }
 
 // Project returns the named project.
@@ -598,6 +662,12 @@ func memberNames(members []*api.ClusterMember) []string {
 func (s *simulator) place(ctx context.Context, res *result, req *apiScriptlet.InstancePlacement, candidates []*api.ClusterMember, timeout time.Duration) (string, error) {
 	res.Candidates = memberNames(candidates)
 
+	// The daemon orders candidates by their instance count across all projects.
+	res.InstanceCounts = map[string]int{}
+	for _, name := range res.Candidates {
+		res.InstanceCounts[name] = s.instancesCount("", name)
+	}
+
 	if !s.hasScriptlet {
 		return "", nil
 	}
@@ -626,10 +696,10 @@ func (res *result) reject(err error) {
 // fallbackDetail explains why the built-in placement logic was used.
 func (s *simulator) fallbackDetail() string {
 	if !s.hasScriptlet {
-		return "no scriptlet loaded, least loaded candidate used"
+		return "no scriptlet loaded, candidate with the fewest instances used"
 	}
 
-	return "scriptlet didn't call set_target, least loaded candidate used"
+	return "scriptlet didn't call set_target, candidate with the fewest instances used"
 }
 
 // createOptions describes a new instance request.
@@ -746,7 +816,7 @@ func (s *simulator) create(ctx context.Context, opts createOptions) (*result, er
 			}
 		}
 
-		candidates, err = s.candidates(architectures, targetGroup, restrictedClusterGroups(p))
+		candidates, res.Excluded, err = s.candidates(architectures, targetGroup, restrictedClusterGroups(p))
 		if err != nil {
 			return nil, err
 		}
@@ -846,7 +916,7 @@ func (s *simulator) move(ctx context.Context, projectName string, name string, t
 			return nil, err
 		}
 
-		candidates, err = s.candidates([]int{arch}, targetGroup, restrictedClusterGroups(p))
+		candidates, res.Excluded, err = s.candidates([]int{arch}, targetGroup, restrictedClusterGroups(p))
 		if err != nil {
 			return nil, err
 		}
@@ -888,7 +958,7 @@ func (s *simulator) move(ctx context.Context, projectName string, name string, t
 		res.Outcome = outcomeScriptlet
 		res.Target = scriptTarget
 	default:
-		// Pick the least loaded member other than the current one.
+		// Pick the member with the fewest instances other than the current one.
 		for _, candidate := range candidates {
 			if candidate.ServerName != inst.Location {
 				res.Outcome = outcomeBuiltin
@@ -1002,10 +1072,12 @@ func (s *simulator) evacuate(ctx context.Context, memberName string, heal bool) 
 		}
 
 		// Filter candidates by the instance's cluster group and offline servers.
-		candidates, err := s.candidates([]int{arch}, inst.Config["volatile.cluster.group"], restrictedClusterGroups(p))
+		candidates, excluded, err := s.candidates([]int{arch}, inst.Config["volatile.cluster.group"], restrictedClusterGroups(p))
 		if err != nil {
 			return nil, err
 		}
+
+		res.Excluded = excluded
 
 		// Nothing for the scriptlet to choose from, so the instance is stopped in place.
 		if len(candidates) == 0 {
