@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"time"
@@ -16,8 +17,9 @@ import (
 type cmdCapture struct {
 	global *cmdGlobal
 
-	flagOutput   string
-	flagNoRedact bool
+	flagOutput       string
+	flagNoRedact     bool
+	flagShowRequests bool
 }
 
 func (c *cmdCapture) command() *cobra.Command {
@@ -32,6 +34,9 @@ func (c *cmdCapture) command() *cobra.Command {
   into a snapshot file that can then be used with the "run" command.
 
   Only read access to the cluster is needed and nothing gets modified.
+  Once connected, any request other than a GET is refused before it gets
+  sent. Use --show-requests to list the requests as they are made.
+
   Configuration keys which commonly hold secrets (cloud-init and
   environment) have their value redacted unless --no-redact is passed.
 `
@@ -40,6 +45,7 @@ func (c *cmdCapture) command() *cobra.Command {
 
 	cmd.Flags().StringVarP(&c.flagOutput, "output", "o", "cluster.yaml", "Snapshot file to write (- for standard output)")
 	cmd.Flags().BoolVar(&c.flagNoRedact, "no-redact", false, "Keep the value of sensitive configuration keys")
+	cmd.Flags().BoolVar(&c.flagShowRequests, "show-requests", false, "Print every request sent to the cluster")
 
 	return cmd
 }
@@ -56,6 +62,17 @@ func (c *cmdCapture) run(cmd *cobra.Command, args []string) error {
 	}
 
 	server, err := conf.GetInstanceServer(remote)
+	if err != nil {
+		return err
+	}
+
+	// Refuse anything but GET requests from here on.
+	var requestLog io.Writer
+	if c.flagShowRequests {
+		requestLog = os.Stderr
+	}
+
+	err = restrictToReadOnly(server, requestLog)
 	if err != nil {
 		return err
 	}
