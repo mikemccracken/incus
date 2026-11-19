@@ -70,8 +70,8 @@ func (c *cmdTest) command() *cobra.Command {
                 member once the step is done, "*" matching all others
     apart       instances which must all be on different cluster members
 `
-	cmd.Example = `  incus-placement test scenarios/*.yaml
-  incus-placement test evacuation.yaml -s new-placement.star -v`
+	cmd.Example = `  incus-placement-sim test scenarios/*.yaml
+  incus-placement-sim test evacuation.yaml -s new-placement.star -v`
 	cmd.Args = cobra.MinimumNArgs(1)
 	cmd.RunE = c.run
 
