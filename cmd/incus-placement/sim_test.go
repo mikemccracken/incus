@@ -25,7 +25,13 @@ func testSimulator(t *testing.T, scriptlet string) *simulator {
 func testScriptlet(t *testing.T) string {
 	t.Helper()
 
-	src, err := os.ReadFile("testdata/spread.star")
+	return testScriptletFile(t, "testdata/spread.star")
+}
+
+func testScriptletFile(t *testing.T, path string) string {
+	t.Helper()
+
+	src, err := os.ReadFile(path)
 	require.NoError(t, err)
 
 	return string(src)
@@ -108,6 +114,31 @@ func TestEvacuate(t *testing.T) {
 	require.Equal(t, "cache1", results[1].Instance)
 	require.Equal(t, outcomeStays, results[1].Outcome)
 	require.Equal(t, "node2", sim.instance("default", "cache1").Location)
+}
+
+func TestCommittedMemoryScriptlet(t *testing.T) {
+	sim := testSimulator(t, testScriptletFile(t, "testdata/committed.star"))
+	opts := createOptions{Project: "default", Name: "big1", Type: "virtual-machine", Config: map[string]string{"limits.memory": "100GiB"}}
+
+	// The member with the most uncommitted memory is used.
+	res, err := sim.create(context.Background(), opts)
+	require.NoError(t, err)
+	require.Equal(t, "node3", res.Target)
+
+	// That placement counts against it, so the next instance goes elsewhere.
+	opts.Name = "big2"
+	opts.Config = map[string]string{"limits.memory": "40GiB"}
+	res, err = sim.create(context.Background(), opts)
+	require.NoError(t, err)
+	require.Equal(t, outcomeScriptlet, res.Outcome)
+	require.NotEqual(t, "node3", res.Target)
+
+	// Once nothing fits, the request is rejected.
+	opts.Name = "big3"
+	opts.Config = map[string]string{"limits.memory": "500GiB"}
+	res, err = sim.create(context.Background(), opts)
+	require.NoError(t, err)
+	require.Equal(t, outcomeRejected, res.Outcome)
 }
 
 func TestInstanceResources(t *testing.T) {
