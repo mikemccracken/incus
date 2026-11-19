@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
-	"text/tabwriter"
 
 	"github.com/spf13/cobra"
 
@@ -18,9 +20,11 @@ type cmdRun struct {
 	global *cmdGlobal
 
 	flagCluster     string
-	flagScriptlet   string
+	flagScriptlets  []string
+	flagCompare     bool
 	flagLocalMember string
 	flagFormat      string
+	flagColor       string
 }
 
 // report is the outcome of a simulated action.
@@ -49,12 +53,18 @@ func (c *cmdRun) command() *cobra.Command {
   If there is none, the built-in placement logic is shown instead, which
   picks the candidate with the fewest instances (across all projects),
   regardless of CPU or memory usage.
+
+  Passing several scriptlets, or --compare, runs the action once for each
+  of them and once with the built-in logic, always starting from the same
+  snapshot, then shows where every instance ends up side by side.
 `
 
 	cmd.PersistentFlags().StringVarP(&c.flagCluster, "cluster", "c", "cluster.yaml", "Cluster snapshot file")
-	cmd.PersistentFlags().StringVarP(&c.flagScriptlet, "scriptlet", "s", "", "Instance placement scriptlet file")
+	cmd.PersistentFlags().StringArrayVarP(&c.flagScriptlets, "scriptlet", "s", nil, "Instance placement scriptlet file (repeat to compare several)")
+	cmd.PersistentFlags().BoolVar(&c.flagCompare, "compare", false, "Compare the scriptlet with the built-in placement")
 	cmd.PersistentFlags().StringVar(&c.flagLocalMember, "local-member", "", "Cluster member handling the request (defaults to the first member)")
 	cmd.PersistentFlags().StringVar(&c.flagFormat, "format", "text", "Output format (text or json)")
+	cmd.PersistentFlags().StringVar(&c.flagColor, "color", "auto", "Color the text output (auto, always or never)")
 
 	// create sub-command.
 	createCmd := cmdRunCreate{run: c}
@@ -71,32 +81,81 @@ func (c *cmdRun) command() *cobra.Command {
 	return cmd
 }
 
-// simulator loads the snapshot and scriptlet and returns a ready to use simulator.
-func (c *cmdRun) simulator() (*simulator, error) {
+// builtinVariant is the name given to the built-in placement logic.
+const builtinVariant = "built-in"
+
+// variant is a placement logic to simulate, the built-in one when it has no scriptlet.
+type variant struct {
+	Name      string
+	Scriptlet string
+}
+
+// variantReport is the outcome of a simulated action for one placement logic.
+type variantReport struct {
+	report
+
+	Name string `json:"name"`
+}
+
+// comparison is the outcome of a simulated action for several placement logics.
+type comparison struct {
+	Variants []variantReport `json:"variants"`
+}
+
+// variants returns the placement logics to simulate and whether to show them side by side.
+func (c *cmdRun) variants() ([]variant, bool, error) {
 	if c.flagFormat != "text" && c.flagFormat != "json" {
-		return nil, fmt.Errorf("Invalid format %q", c.flagFormat)
+		return nil, false, fmt.Errorf("Invalid format %q", c.flagFormat)
 	}
 
 	snap, err := loadSnapshot(c.flagCluster)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
-	src := snap.Server.Config["instances.placement.scriptlet"]
-	if c.flagScriptlet != "" {
-		content, err := os.ReadFile(c.flagScriptlet)
+	captured := snap.Server.Config["instances.placement.scriptlet"]
+
+	names := []string{builtinVariant, "captured"}
+	scriptlets := make([]variant, 0, len(c.flagScriptlets))
+	for _, path := range c.flagScriptlets {
+		content, err := os.ReadFile(path)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 
-		src = string(content)
-	} else if src != "" {
-		fmt.Fprintln(os.Stderr, "Using the scriptlet captured with the cluster")
-	} else {
-		fmt.Fprintln(os.Stderr, "No scriptlet provided, showing the built-in placement (candidate with the fewest instances)")
+		// Fallback to the full path when two files share a name.
+		name := filepath.Base(path)
+		if slices.Contains(names, name) {
+			name = path
+		}
+
+		names = append(names, name)
+		scriptlets = append(scriptlets, variant{Name: name, Scriptlet: string(content)})
 	}
 
-	return newSimulator(snap, src, c.flagLocalMember)
+	if !c.flagCompare && len(scriptlets) < 2 {
+		if len(scriptlets) == 1 {
+			return scriptlets, false, nil
+		}
+
+		if captured != "" {
+			fmt.Fprintln(os.Stderr, "Using the scriptlet captured with the cluster")
+
+			return []variant{{Name: "captured", Scriptlet: captured}}, false, nil
+		}
+
+		fmt.Fprintln(os.Stderr, "No scriptlet provided, showing the built-in placement (candidate with the fewest instances)")
+
+		return []variant{{Name: builtinVariant}}, false, nil
+	}
+
+	// A comparison starts with the built-in logic, then what the cluster currently runs.
+	all := []variant{{Name: builtinVariant}}
+	if captured != "" {
+		all = append(all, variant{Name: "captured", Scriptlet: captured})
+	}
+
+	return append(all, scriptlets...), true, nil
 }
 
 // counts returns the number of instances on each cluster member.
@@ -109,18 +168,23 @@ func counts(sim *simulator) map[string]int {
 	return result
 }
 
-// execute runs an action and prints its report.
-func (c *cmdRun) execute(action func(sim *simulator) ([]*result, error)) error {
-	sim, err := c.simulator()
+// simulate runs an action with the given placement logic against a fresh copy of the snapshot.
+func (c *cmdRun) simulate(v variant, action func(sim *simulator) ([]*result, error)) (*simulator, report, error) {
+	snap, err := loadSnapshot(c.flagCluster)
 	if err != nil {
-		return err
+		return nil, report{}, err
+	}
+
+	sim, err := newSimulator(snap, v.Scriptlet, c.flagLocalMember)
+	if err != nil {
+		return nil, report{}, err
 	}
 
 	before := counts(sim)
 
 	results, err := action(sim)
 	if err != nil {
-		return err
+		return nil, report{}, err
 	}
 
 	after := counts(sim)
@@ -130,14 +194,175 @@ func (c *cmdRun) execute(action func(sim *simulator) ([]*result, error)) error {
 		rep.Distribution[name] = distribution{Before: before[name], After: after[name]}
 	}
 
-	if c.flagFormat == "json" {
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
+	return sim, rep, nil
+}
 
-		return enc.Encode(rep)
+// execute runs an action and prints its report.
+func (c *cmdRun) execute(action func(sim *simulator) ([]*result, error)) error {
+	pal, err := newPalette(c.flagColor)
+	if err != nil {
+		return err
 	}
 
-	return printReport(os.Stdout, sim, rep)
+	variants, compare, err := c.variants()
+	if err != nil {
+		return err
+	}
+
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+
+	if !compare {
+		sim, rep, err := c.simulate(variants[0], action)
+		if err != nil {
+			return err
+		}
+
+		if c.flagFormat == "json" {
+			return enc.Encode(rep)
+		}
+
+		return printReport(os.Stdout, sim, rep, pal)
+	}
+
+	// The scriptlet is a process wide setting, so the variants are run one after the other.
+	var sim *simulator
+
+	cmp := comparison{}
+	for _, v := range variants {
+		var rep report
+
+		sim, rep, err = c.simulate(v, action)
+		if err != nil {
+			return fmt.Errorf("%s: %w", v.Name, err)
+		}
+
+		cmp.Variants = append(cmp.Variants, variantReport{report: rep, Name: v.Name})
+	}
+
+	if c.flagFormat == "json" {
+		return enc.Encode(cmp)
+	}
+
+	printComparison(os.Stdout, sim, cmp, pal)
+
+	return nil
+}
+
+// outcomeCell summarizes a placement for the comparison table.
+func outcomeCell(res *result, baseline *result, pal *palette) cell {
+	if res == nil {
+		return cell{text: "-"}
+	}
+
+	switch res.Outcome {
+	case outcomeRejected:
+		return cell{text: "REJECTED", style: pal.bad}
+	case outcomeStays:
+		return cell{text: "stays", style: pal.caution}
+	}
+
+	// Mark the placements where a scriptlet left the choice to the built-in logic.
+	c := cell{text: res.Target}
+	if res == baseline {
+		return c
+	}
+
+	if res.Outcome == outcomeBuiltin {
+		c.text += "*"
+	}
+
+	// Highlight what differs from the built-in logic.
+	if res.Target != baseline.Target {
+		c.style = pal.tag
+	}
+
+	return c
+}
+
+// printComparison writes where each instance ends up for every placement logic.
+func printComparison(w io.Writer, sim *simulator, cmp comparison, pal *palette) {
+	key := func(res *result) string {
+		return res.Project + "/" + res.Instance
+	}
+
+	// Index the results of each variant by instance.
+	indexes := make([]map[string]*result, 0, len(cmp.Variants))
+	for _, v := range cmp.Variants {
+		index := map[string]*result{}
+		for _, res := range v.Results {
+			index[key(res)] = res
+		}
+
+		indexes = append(indexes, index)
+	}
+
+	header := []cell{{text: "INSTANCE", style: pal.title}}
+	for _, v := range cmp.Variants {
+		header = append(header, cell{text: v.Name, style: pal.title})
+	}
+
+	fallback := false
+	rows := [][]cell{header}
+	for _, res := range cmp.Variants[0].Results {
+		row := []cell{{text: key(res)}}
+		for i := range cmp.Variants {
+			c := outcomeCell(indexes[i][key(res)], res, pal)
+			fallback = fallback || strings.HasSuffix(c.text, "*")
+			row = append(row, c)
+		}
+
+		rows = append(rows, row)
+	}
+
+	printTable(w, rows)
+
+	if fallback {
+		_, _ = fmt.Fprintln(w, pal.dim.Sprint("* the scriptlet didn't call set_target, the candidate with the fewest instances was used"))
+	}
+
+	// Explain the rejections.
+	for _, v := range cmp.Variants {
+		for _, res := range v.Results {
+			if res.Outcome == outcomeRejected {
+				_, _ = fmt.Fprintf(w, "%s %s\n", pal.bad.Sprintf("%s rejected %s:", v.Name, key(res)), res.Error)
+			}
+		}
+	}
+
+	_, _ = fmt.Fprintln(w)
+
+	// Show the resulting instance distribution in member order.
+	header = []cell{{text: "MEMBER", style: pal.title}, {text: "STATUS", style: pal.title}, {text: "BEFORE", style: pal.title}}
+	for _, v := range cmp.Variants {
+		header = append(header, cell{text: v.Name, style: pal.title})
+	}
+
+	rows = [][]cell{header}
+	for _, member := range sim.snap.Members {
+		status := cell{text: member.Status}
+		if member.Status != "Online" {
+			status.style = pal.caution
+		}
+
+		baseline := cmp.Variants[0].Distribution[member.ServerName]
+
+		row := []cell{{text: member.ServerName}, status, {text: strconv.Itoa(baseline.Before)}}
+		for _, v := range cmp.Variants {
+			after := v.Distribution[member.ServerName].After
+
+			c := cell{text: strconv.Itoa(after)}
+			if after != baseline.After {
+				c.style = pal.tag
+			}
+
+			row = append(row, c)
+		}
+
+		rows = append(rows, row)
+	}
+
+	printTable(w, rows)
 }
 
 // instancesLabel formats an instance count.
@@ -149,67 +374,104 @@ func instancesLabel(count int) string {
 	return fmt.Sprintf("%d instances", count)
 }
 
+// printResult writes the details of a single placement.
+func printResult(w io.Writer, res *result, hasScriptlet bool, pal *palette, indent string) {
+	label := func(name string) string {
+		return pal.dim.Sprintf("%-11s", name)
+	}
+
+	header := pal.tag.Sprintf("[%s]", res.Reason) + " " + pal.title.Sprintf("%s/%s", res.Project, res.Instance)
+	if res.Source != "" {
+		header += pal.dim.Sprintf(" (on %s)", res.Source)
+	}
+
+	_, _ = fmt.Fprintln(w, indent+header)
+
+	if res.Candidates != nil {
+		entries := make([]string, 0, len(res.Candidates))
+		for _, name := range res.Candidates {
+			entries = append(entries, name+pal.dim.Sprintf(" (%s)", instancesLabel(res.InstanceCounts[name])))
+		}
+
+		_, _ = fmt.Fprintf(w, "%s  %s %s\n", indent, label("candidates:"), strings.Join(entries, ", "))
+	}
+
+	for i, entry := range res.Excluded {
+		name := "excluded:"
+		if i > 0 {
+			name = ""
+		}
+
+		_, _ = fmt.Fprintf(w, "%s  %s %s%s\n", indent, label(name), entry.Member, pal.dim.Sprintf(" (%s)", entry.Reason))
+	}
+
+	for _, entry := range res.Trace {
+		_, _ = fmt.Fprintln(w, indent+pal.trace(entry.Kind).Sprintf("    %-5s %s", entry.Kind, entry.Message))
+	}
+
+	var outcome string
+
+	switch res.Outcome {
+	case outcomeScriptlet:
+		outcome = pal.good.Sprint(res.Target) + pal.dim.Sprint(" (set by scriptlet)")
+	case outcomeBuiltin:
+		// A scriptlet which didn't pick a target is worth a second look.
+		style := pal.good
+		if hasScriptlet {
+			style = pal.caution
+		}
+
+		outcome = style.Sprint(res.Target) + pal.dim.Sprintf(" (built-in: %s)", res.Detail)
+	case outcomeValidated:
+		outcome = pal.good.Sprint(res.Target) + pal.dim.Sprintf(" (accepted: %s)", res.Detail)
+	case outcomeStays:
+		outcome = pal.caution.Sprintf("stays on %s", res.Target) + pal.dim.Sprintf(" (%s)", res.Detail)
+	case outcomeRejected:
+		outcome = pal.bad.Sprintf("REJECTED: %s", res.Error)
+	}
+
+	_, _ = fmt.Fprintf(w, "%s  %s %s\n", indent, label("result:"), outcome)
+
+	if res.Duration != "" {
+		_, _ = fmt.Fprintln(w, indent+pal.dim.Sprintf("  %-11s %s", "duration:", res.Duration))
+	}
+}
+
 // printReport writes a human readable report.
-func printReport(w io.Writer, sim *simulator, rep report) error {
+func printReport(w io.Writer, sim *simulator, rep report, pal *palette) error {
 	for _, res := range rep.Results {
-		header := fmt.Sprintf("[%s] %s/%s", res.Reason, res.Project, res.Instance)
-		if res.Source != "" {
-			header += " (on " + res.Source + ")"
-		}
-
-		_, _ = fmt.Fprintln(w, header)
-
-		if res.Candidates != nil {
-			entries := make([]string, 0, len(res.Candidates))
-			for _, name := range res.Candidates {
-				entries = append(entries, fmt.Sprintf("%s (%s)", name, instancesLabel(res.InstanceCounts[name])))
-			}
-
-			_, _ = fmt.Fprintf(w, "  candidates: %s\n", strings.Join(entries, ", "))
-		}
-
-		for i, entry := range res.Excluded {
-			label := "excluded:"
-			if i > 0 {
-				label = ""
-			}
-
-			_, _ = fmt.Fprintf(w, "  %-11s %s (%s)\n", label, entry.Member, entry.Reason)
-		}
-
-		for _, entry := range res.Trace {
-			_, _ = fmt.Fprintf(w, "    %-5s %s\n", entry.Kind, entry.Message)
-		}
-
-		switch res.Outcome {
-		case outcomeScriptlet:
-			_, _ = fmt.Fprintf(w, "  result:     %s (set by scriptlet)\n", res.Target)
-		case outcomeBuiltin:
-			_, _ = fmt.Fprintf(w, "  result:     %s (built-in: %s)\n", res.Target, res.Detail)
-		case outcomeValidated:
-			_, _ = fmt.Fprintf(w, "  result:     %s (accepted: %s)\n", res.Target, res.Detail)
-		case outcomeStays:
-			_, _ = fmt.Fprintf(w, "  result:     stays on %s (%s)\n", res.Target, res.Detail)
-		case outcomeRejected:
-			_, _ = fmt.Fprintf(w, "  result:     REJECTED: %s\n", res.Error)
-		}
-
-		if res.Duration != "" {
-			_, _ = fmt.Fprintf(w, "  duration:   %s\n", res.Duration)
-		}
+		printResult(w, res, sim.hasScriptlet, pal, "")
 
 		_, _ = fmt.Fprintln(w)
 	}
 
 	// Show the instance distribution in member order.
-	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	_, _ = fmt.Fprintln(tw, "MEMBER\tSTATUS\tINSTANCES BEFORE\tINSTANCES AFTER")
+	rows := [][]cell{{
+		{text: "MEMBER", style: pal.title},
+		{text: "STATUS", style: pal.title},
+		{text: "INSTANCES BEFORE", style: pal.title},
+		{text: "INSTANCES AFTER", style: pal.title},
+	}}
+
 	for _, member := range sim.snap.Members {
 		dist := rep.Distribution[member.ServerName]
-		_, _ = fmt.Fprintf(tw, "%s\t%s\t%d\t%d\n", member.ServerName, member.Status, dist.Before, dist.After)
+
+		status := cell{text: member.Status}
+		if member.Status != "Online" {
+			status.style = pal.caution
+		}
+
+		after := cell{text: strconv.Itoa(dist.After)}
+		if dist.After != dist.Before {
+			after.style = pal.title
+		}
+
+		rows = append(rows, []cell{{text: member.ServerName}, status, {text: strconv.Itoa(dist.Before)}, after})
 	}
 
-	return tw.Flush()
+	printTable(w, rows)
+
+	return nil
 }
 
 // parseKeyValues parses a list of key=value entries.
