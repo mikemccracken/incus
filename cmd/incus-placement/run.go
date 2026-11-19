@@ -22,6 +22,7 @@ type cmdRun struct {
 	flagCluster     string
 	flagScriptlets  []string
 	flagCompare     bool
+	flagDetails     bool
 	flagLocalMember string
 	flagFormat      string
 	flagColor       string
@@ -57,11 +58,14 @@ func (c *cmdRun) command() *cobra.Command {
   Passing several scriptlets, or --compare, runs the action once for each
   of them and once with the built-in logic, always starting from the same
   snapshot, then shows where every instance ends up side by side.
+  Add --details to also get the candidates, exclusions and scriptlet
+  activity of every placement, for each of the scriptlets in turn.
 `
 
 	cmd.PersistentFlags().StringVarP(&c.flagCluster, "cluster", "c", "cluster.yaml", "Cluster snapshot file")
 	cmd.PersistentFlags().StringArrayVarP(&c.flagScriptlets, "scriptlet", "s", nil, "Instance placement scriptlet file (repeat to compare several)")
 	cmd.PersistentFlags().BoolVar(&c.flagCompare, "compare", false, "Compare the scriptlet with the built-in placement")
+	cmd.PersistentFlags().BoolVar(&c.flagDetails, "details", false, "Show the details of every placement before the comparison")
 	cmd.PersistentFlags().StringVar(&c.flagLocalMember, "local-member", "", "Cluster member handling the request (defaults to the first member)")
 	cmd.PersistentFlags().StringVar(&c.flagFormat, "format", "text", "Output format (text or json)")
 	cmd.PersistentFlags().StringVar(&c.flagColor, "color", "auto", "Color the text output (auto, always or never)")
@@ -238,10 +242,24 @@ func (c *cmdRun) execute(action func(sim *simulator) ([]*result, error)) error {
 		}
 
 		cmp.Variants = append(cmp.Variants, variantReport{report: rep, Name: v.Name})
+
+		// Show how this variant got to its placements.
+		if c.flagDetails && c.flagFormat != "json" {
+			fmt.Println(pal.title.Sprintf("=== %s ===", v.Name))
+
+			for _, res := range rep.Results {
+				printResult(os.Stdout, res, sim.hasScriptlet, pal, "")
+				fmt.Println()
+			}
+		}
 	}
 
 	if c.flagFormat == "json" {
 		return enc.Encode(cmp)
+	}
+
+	if c.flagDetails {
+		fmt.Println(pal.title.Sprint("=== comparison ==="))
 	}
 
 	printComparison(os.Stdout, sim, cmp, pal)
