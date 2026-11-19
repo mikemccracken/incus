@@ -14,6 +14,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/lxc/incus/v7/shared/api"
+	"github.com/lxc/incus/v7/shared/units"
 )
 
 type cmdRun struct {
@@ -34,10 +35,14 @@ type report struct {
 	Distribution map[string]distribution `json:"distribution"`
 }
 
-// distribution is the instance count of a cluster member before and after an action.
+// distribution is the instance count and committed resources of a cluster member before and after an action.
 type distribution struct {
-	Before int `json:"before"`
-	After  int `json:"after"`
+	Before                int    `json:"before"`
+	After                 int    `json:"after"`
+	CommittedCPUsBefore   uint64 `json:"committed_cpus_before"`
+	CommittedCPUsAfter    uint64 `json:"committed_cpus_after"`
+	CommittedMemoryBefore uint64 `json:"committed_memory_before"`
+	CommittedMemoryAfter  uint64 `json:"committed_memory_after"`
 }
 
 func (c *cmdRun) command() *cobra.Command {
@@ -162,16 +167,6 @@ func (c *cmdRun) variants() ([]variant, bool, error) {
 	return append(all, scriptlets...), true, nil
 }
 
-// counts returns the number of instances on each cluster member.
-func counts(sim *simulator) map[string]int {
-	result := map[string]int{}
-	for _, member := range sim.snap.Members {
-		result[member.ServerName] = sim.instancesCount("", member.ServerName)
-	}
-
-	return result
-}
-
 // simulate runs an action with the given placement logic against a fresh copy of the snapshot.
 func (c *cmdRun) simulate(v variant, action func(sim *simulator) ([]*result, error)) (*simulator, report, error) {
 	snap, err := loadSnapshot(c.flagCluster)
@@ -184,18 +179,25 @@ func (c *cmdRun) simulate(v variant, action func(sim *simulator) ([]*result, err
 		return nil, report{}, err
 	}
 
-	before := counts(sim)
+	before := sim.usage()
 
 	results, err := action(sim)
 	if err != nil {
 		return nil, report{}, err
 	}
 
-	after := counts(sim)
+	after := sim.usage()
 
 	rep := report{Results: results, Distribution: map[string]distribution{}}
 	for name := range before {
-		rep.Distribution[name] = distribution{Before: before[name], After: after[name]}
+		rep.Distribution[name] = distribution{
+			Before:                before[name].Instances,
+			After:                 after[name].Instances,
+			CommittedCPUsBefore:   before[name].CPUs,
+			CommittedCPUsAfter:    after[name].CPUs,
+			CommittedMemoryBefore: before[name].Memory,
+			CommittedMemoryAfter:  after[name].Memory,
+		}
 	}
 
 	return sim, rep, nil
@@ -350,22 +352,20 @@ func printComparison(w io.Writer, sim *simulator, cmp comparison, pal *palette) 
 
 	_, _ = fmt.Fprintln(w)
 
-	// Show the resulting instance distribution in member order.
-	header = []cell{{text: "MEMBER", style: pal.title}, {text: "STATUS", style: pal.title}, {text: "BEFORE", style: pal.title}}
+	// Show the members with their resources and resulting instance count, in member order.
+	_, _ = fmt.Fprintln(w, pal.dim.Sprint("Instances on each member:"))
+
+	header = append(memberHeader(pal), cell{text: "BEFORE", style: pal.title})
 	for _, v := range cmp.Variants {
 		header = append(header, cell{text: v.Name, style: pal.title})
 	}
 
 	rows = [][]cell{header}
-	for _, member := range sim.snap.Members {
-		status := cell{text: member.Status}
-		if member.Status != "Online" {
-			status.style = pal.caution
-		}
-
+	for i := range sim.snap.Members {
+		member := &sim.snap.Members[i]
 		baseline := cmp.Variants[0].Distribution[member.ServerName]
 
-		row := []cell{{text: member.ServerName}, status, {text: strconv.Itoa(baseline.Before)}}
+		row := append(memberCells(member, pal), cell{text: strconv.Itoa(baseline.Before)})
 		for _, v := range cmp.Variants {
 			after := v.Distribution[member.ServerName].After
 
@@ -381,6 +381,96 @@ func printComparison(w io.Writer, sim *simulator, cmp comparison, pal *palette) 
 	}
 
 	printTable(w, rows)
+
+	// Then what those instances add up to.
+	committedTable(w, sim, cmp, pal, "CPUs committed on each member:", "CPUS", 3, func(dist distribution) (string, string) {
+		return strconv.FormatUint(dist.CommittedCPUsBefore, 10), strconv.FormatUint(dist.CommittedCPUsAfter, 10)
+	})
+
+	committedTable(w, sim, cmp, pal, "Memory committed on each member:", "MEMORY", 4, func(dist distribution) (string, string) {
+		return sizeLabel(dist.CommittedMemoryBefore), sizeLabel(dist.CommittedMemoryAfter)
+	})
+
+	_, _ = fmt.Fprintln(w, pal.dim.Sprint(memberLegend))
+}
+
+// committedTable writes what a member's instances add up to for every placement logic, next to its capacity.
+func committedTable(w io.Writer, sim *simulator, cmp comparison, pal *palette, title string, capacity string, capacityColumn int, values func(dist distribution) (string, string)) {
+	_, _ = fmt.Fprintln(w)
+	_, _ = fmt.Fprintln(w, pal.dim.Sprint(title))
+
+	header := []cell{{text: "MEMBER", style: pal.title}, {text: capacity, style: pal.title}, {text: "BEFORE", style: pal.title}}
+	for _, v := range cmp.Variants {
+		header = append(header, cell{text: v.Name, style: pal.title})
+	}
+
+	rows := [][]cell{header}
+	for i := range sim.snap.Members {
+		member := &sim.snap.Members[i]
+
+		before, baseline := values(cmp.Variants[0].Distribution[member.ServerName])
+
+		row := []cell{{text: member.ServerName}, memberCells(member, pal)[capacityColumn], {text: before}}
+		for _, v := range cmp.Variants {
+			_, after := values(v.Distribution[member.ServerName])
+
+			c := cell{text: after}
+			if after != baseline {
+				c.style = pal.tag
+			}
+
+			row = append(row, c)
+		}
+
+		rows = append(rows, row)
+	}
+
+	printTable(w, rows)
+}
+
+// memberLegend explains the resource columns of the member tables.
+const memberLegend = "CPUS, MEMORY and MEMORY USED come from the member when it was captured, COMMITTED is the sum of the limits of its instances."
+
+// sizeLabel formats a size in bytes.
+func sizeLabel(size uint64) string {
+	return units.GetByteSizeStringIEC(int64(size), 0)
+}
+
+// memberHeader returns the header of the columns describing a cluster member.
+func memberHeader(pal *palette) []cell {
+	header := []cell{}
+	for _, name := range []string{"MEMBER", "STATUS", "ARCH", "CPUS", "MEMORY", "MEMORY USED"} {
+		header = append(header, cell{text: name, style: pal.title})
+	}
+
+	return header
+}
+
+// memberCells returns the columns describing a cluster member and its resources.
+func memberCells(member *SnapshotMember, pal *palette) []cell {
+	status := cell{text: member.Status}
+	if member.Status != "Online" {
+		status.style = pal.caution
+	}
+
+	// Resources are missing for the members which couldn't be reached during the capture.
+	cpus, memory, used := "-", "-", "-"
+	if member.Resources != nil {
+		cpus = strconv.FormatUint(member.Resources.CPU.Total, 10)
+		memory = sizeLabel(member.Resources.Memory.Total)
+		used = sizeLabel(member.Resources.Memory.Used)
+	}
+
+	return []cell{{text: member.ServerName}, status, {text: member.Architecture}, {text: cpus}, {text: memory}, {text: used}}
+}
+
+// changeCell shows a value, or both values if the action changed it.
+func changeCell(before string, after string, pal *palette) cell {
+	if before == after {
+		return cell{text: before}
+	}
+
+	return cell{text: before + " -> " + after, style: pal.title}
 }
 
 // instancesLabel formats an instance count.
@@ -463,31 +553,29 @@ func printReport(w io.Writer, sim *simulator, rep report, pal *palette) error {
 		_, _ = fmt.Fprintln(w)
 	}
 
-	// Show the instance distribution in member order.
-	rows := [][]cell{{
-		{text: "MEMBER", style: pal.title},
-		{text: "STATUS", style: pal.title},
-		{text: "INSTANCES BEFORE", style: pal.title},
-		{text: "INSTANCES AFTER", style: pal.title},
-	}}
+	// Show the members with their resources and what the action changed, in member order.
+	header := memberHeader(pal)
+	for _, name := range []string{"INSTANCES", "COMMITTED CPUS", "COMMITTED MEMORY"} {
+		header = append(header, cell{text: name, style: pal.title})
+	}
 
-	for _, member := range sim.snap.Members {
+	rows := [][]cell{header}
+	for i := range sim.snap.Members {
+		member := &sim.snap.Members[i]
 		dist := rep.Distribution[member.ServerName]
 
-		status := cell{text: member.Status}
-		if member.Status != "Online" {
-			status.style = pal.caution
-		}
+		row := memberCells(member, pal)
+		row = append(row, changeCell(strconv.Itoa(dist.Before), strconv.Itoa(dist.After), pal))
+		row = append(row, changeCell(strconv.FormatUint(dist.CommittedCPUsBefore, 10), strconv.FormatUint(dist.CommittedCPUsAfter, 10), pal))
+		row = append(row, changeCell(sizeLabel(dist.CommittedMemoryBefore), sizeLabel(dist.CommittedMemoryAfter), pal))
 
-		after := cell{text: strconv.Itoa(dist.After)}
-		if dist.After != dist.Before {
-			after.style = pal.title
-		}
-
-		rows = append(rows, []cell{{text: member.ServerName}, status, {text: strconv.Itoa(dist.Before)}, after})
+		rows = append(rows, row)
 	}
 
 	printTable(w, rows)
+
+	_, _ = fmt.Fprintln(w, pal.dim.Sprint(memberLegend))
+	_, _ = fmt.Fprintln(w, pal.dim.Sprint("Values which changed are shown as before -> after."))
 
 	return nil
 }

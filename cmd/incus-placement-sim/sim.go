@@ -249,6 +249,39 @@ func (s *simulator) instancesCount(projectName string, location string) int {
 	return count
 }
 
+// memberUsage is what the instances placed on a cluster member add up to.
+type memberUsage struct {
+	Instances int
+	CPUs      uint64
+	Memory    uint64
+}
+
+// usage returns the instance count and the sum of the instance limits of each cluster member.
+func (s *simulator) usage() map[string]memberUsage {
+	result := map[string]memberUsage{}
+	for _, member := range s.snap.Members {
+		result[member.ServerName] = memberUsage{}
+	}
+
+	for i := range s.snap.Instances {
+		inst := &s.snap.Instances[i]
+
+		usage := result[inst.Location]
+		usage.Instances++
+
+		// Instances with limits which can't be parsed only count towards the instance total.
+		res, err := instanceResources(inst.ExpandedConfig, inst.ExpandedDevices, api.InstanceType(inst.Type))
+		if err == nil {
+			usage.CPUs += res.CPUCores
+			usage.Memory += res.MemorySize
+		}
+
+		result[inst.Location] = usage
+	}
+
+	return result
+}
+
 // groupExists returns whether the named cluster group exists.
 func (s *simulator) groupExists(name string) bool {
 	for _, group := range s.snap.Groups {
