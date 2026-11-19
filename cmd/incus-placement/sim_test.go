@@ -141,6 +141,22 @@ func TestCommittedMemoryScriptlet(t *testing.T) {
 	require.Equal(t, outcomeRejected, res.Outcome)
 }
 
+func TestScenario(t *testing.T) {
+	sc, err := loadScenario("testdata/scenario.yaml")
+	require.NoError(t, err)
+
+	// The scenario was written for the scriptlet it names.
+	for _, rep := range sc.run(context.Background(), testSimulator(t, testScriptlet(t))) {
+		require.Empty(t, rep.Failures, rep.Name)
+	}
+
+	// The built-in placement doesn't keep the database instances apart.
+	reports := sc.run(context.Background(), testSimulator(t, ""))
+	require.Len(t, reports, len(sc.Steps))
+	require.Contains(t, reports[1].Failures, `default/db3: expected outcome "rejected", got node3 (builtin)`)
+	require.Contains(t, reports[2].Failures, `couldn't run: Instance "db3" already exists`)
+}
+
 func TestInstanceResources(t *testing.T) {
 	root := map[string]map[string]string{"root": {"type": "disk", "path": "/", "pool": "local"}}
 
