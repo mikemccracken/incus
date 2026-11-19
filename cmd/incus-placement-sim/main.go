@@ -17,7 +17,7 @@ type cmdGlobal struct {
 
 func main() {
 	app := &cobra.Command{}
-	app.Use = "incus-placement"
+	app.Use = "incus-placement-sim"
 	app.Short = "Develop and test instance placement scriptlets"
 	app.Long = `Description:
   Develop and test instance placement scriptlets

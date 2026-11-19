@@ -531,8 +531,8 @@ func (c *cmdRunCreate) command() *cobra.Command {
 
   The scriptlet is called with the "new" reason.
 `
-	cmd.Example = `  incus-placement run create -c cluster.yaml -s placement.star --name web1 --config limits.memory=4GiB
-  incus-placement run create -c cluster.yaml -s placement.star --type virtual-machine --target @gpu`
+	cmd.Example = `  incus-placement-sim run create -c cluster.yaml -s placement.star --name web1 --config limits.memory=4GiB
+  incus-placement-sim run create -c cluster.yaml -s placement.star --type virtual-machine --target @gpu`
 	cmd.Args = cobra.NoArgs
 	cmd.RunE = c.runE
 
@@ -626,8 +626,8 @@ func (c *cmdRunMove) command() *cobra.Command {
   The scriptlet is called with the "relocation" reason. When the target is
   a specific cluster member, the scriptlet can only accept or reject it.
 `
-	cmd.Example = `  incus-placement run move -c cluster.yaml -s placement.star web1 --target @default
-  incus-placement run move -c cluster.yaml -s placement.star web1 --target node2`
+	cmd.Example = `  incus-placement-sim run move -c cluster.yaml -s placement.star web1 --target @default
+  incus-placement-sim run move -c cluster.yaml -s placement.star web1 --target node2`
 	cmd.Args = cobra.ExactArgs(1)
 	cmd.RunE = c.runE
 
