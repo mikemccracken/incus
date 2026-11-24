@@ -5,398 +5,504 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"slices"
+	"path/filepath"
 	"sort"
 	"strings"
 
-	"go.yaml.in/yaml/v4"
+	"go.starlark.net/starlark"
 
 	"github.com/lxc/incus/v7/shared/api"
+	"github.com/lxc/incus/v7/shared/scriptlet"
 )
 
-// scenario is a sequence of actions along with what is expected from each of them.
+// testRunKey is the thread local holding the state of the test being run.
+const testRunKey = "test"
+
+// scenario is a Starlark file holding test functions along with the cluster and scriptlet they apply to.
 type scenario struct {
-	Description string         `yaml:"description"`
-	Cluster     string         `yaml:"cluster"`
-	Scriptlet   string         `yaml:"scriptlet"`
-	LocalMember string         `yaml:"local_member"`
-	Steps       []scenarioStep `yaml:"steps"`
+	Path        string
+	Cluster     string
+	Scriptlet   string
+	LocalMember string
+	Tests       []*starlark.Function
 }
 
-// scenarioStep is a single action, exactly one of create, move or evacuate.
-type scenarioStep struct {
-	Name     string            `yaml:"name"`
-	Create   *scenarioCreate   `yaml:"create"`
-	Move     *scenarioMove     `yaml:"move"`
-	Evacuate *scenarioEvacuate `yaml:"evacuate"`
-	Expect   scenarioExpect    `yaml:"expect"`
+// testRun is the state of a test function while it runs.
+type testRun struct {
+	ctx     context.Context
+	sim     *simulator
+	results []*result
+	output  []string
 }
 
-// scenarioCreate describes the creation of an instance.
-type scenarioCreate struct {
-	Project      string                       `yaml:"project"`
-	Name         string                       `yaml:"name"`
-	Type         string                       `yaml:"type"`
-	Profiles     []string                     `yaml:"profiles"`
-	Config       map[string]string            `yaml:"config"`
-	Devices      map[string]map[string]string `yaml:"devices"`
-	Target       string                       `yaml:"target"`
-	Architecture string                       `yaml:"architecture"`
-	Image        string                       `yaml:"image"`
+// testReport is the outcome of a test function.
+type testReport struct {
+	Name    string
+	Results []*result
+	Output  []string
+	Failure string
 }
 
-// scenarioMove describes moving an instance to a cluster member or group.
-type scenarioMove struct {
-	Project  string `yaml:"project"`
-	Instance string `yaml:"instance"`
-	Target   string `yaml:"target"`
+// currentTest returns the test a builtin was called from.
+func currentTest(thread *starlark.Thread, b *starlark.Builtin) (*testRun, error) {
+	run, ok := thread.Local(testRunKey).(*testRun)
+	if !ok {
+		return nil, fmt.Errorf("%s can only be called from a test function", b.Name())
+	}
+
+	return run, nil
 }
 
-// scenarioEvacuate describes the evacuation (or healing) of a cluster member.
-type scenarioEvacuate struct {
-	Member string `yaml:"member"`
-	Heal   bool   `yaml:"heal"`
+// stringValues converts a Starlark dict into a string map, accepting numbers and booleans as values.
+func stringValues(dict *starlark.Dict) (map[string]string, error) {
+	result := map[string]string{}
+	if dict == nil {
+		return result, nil
+	}
+
+	for _, item := range dict.Items() {
+		key, ok := starlark.AsString(item[0])
+		if !ok {
+			return nil, fmt.Errorf("Invalid key %s, expected a string", item[0].String())
+		}
+
+		switch value := item[1].(type) {
+		case starlark.String:
+			result[key] = string(value)
+		case starlark.Int, starlark.Bool:
+			result[key] = strings.ToLower(value.String())
+		default:
+			return nil, fmt.Errorf("Invalid value for %q, expected a string, integer or boolean", key)
+		}
+	}
+
+	return result, nil
 }
 
-// placementExpect is what is expected from the placement of an instance.
-type placementExpect struct {
-	Outcome   string   `yaml:"outcome"`
-	Target    string   `yaml:"target"`
-	TargetIn  []string `yaml:"target_in"`
-	TargetNot []string `yaml:"target_not"`
-	Error     string   `yaml:"error"`
+// record keeps a placement for the test report and hands it to the scenario.
+func (run *testRun) record(res *result) (starlark.Value, error) {
+	run.results = append(run.results, res)
+
+	return scriptlet.StarlarkMarshal(*res)
 }
 
-// memberExpect is the number of instances expected on a cluster member.
-type memberExpect struct {
-	Instances    *int `yaml:"instances"`
-	MinInstances *int `yaml:"min_instances"`
-	MaxInstances *int `yaml:"max_instances"`
-}
-
-// scenarioExpect is what is expected once a step has run.
-type scenarioExpect struct {
-	placementExpect `yaml:",inline"`
-
-	Instances map[string]placementExpect `yaml:"instances"`
-	Members   map[string]memberExpect    `yaml:"members"`
-	Apart     []string                   `yaml:"apart"`
-}
-
-// stepReport is the outcome of a scenario step.
-type stepReport struct {
-	Name     string
-	Results  []*result
-	Failures []string
-}
-
-// loadScenario reads and validates a scenario file.
-func loadScenario(path string) (*scenario, error) {
-	content, err := os.ReadFile(path)
+// scenarioCreate implements create().
+func scenarioCreate(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+	run, err := currentTest(thread, b)
 	if err != nil {
 		return nil, err
 	}
 
-	sc := &scenario{}
+	var profiles starlark.Value
+	var config *starlark.Dict
+	var devices *starlark.Dict
 
-	// Unknown fields are refused so that a mistyped expectation can't silently pass.
-	err = yaml.Load(content, sc, yaml.WithKnownFields())
+	opts := createOptions{Type: string(api.InstanceTypeContainer), Devices: map[string]map[string]string{}}
+
+	err = starlark.UnpackArgs(b.Name(), args, kwargs, "name", &opts.Name, "project?", &opts.Project, "type?", &opts.Type, "profiles?", &profiles, "config?", &config, "devices?", &devices, "target?", &opts.Target, "architecture?", &opts.Architecture, "image?", &opts.Image)
 	if err != nil {
-		return nil, fmt.Errorf("Failed parsing scenario %q: %w", path, err)
+		return nil, err
 	}
 
-	if len(sc.Steps) == 0 {
-		return nil, fmt.Errorf("Scenario %q doesn't have any step", path)
+	if opts.Type == "vm" {
+		opts.Type = string(api.InstanceTypeVM)
 	}
 
-	for i := range sc.Steps {
-		err = sc.Steps[i].validate()
-		if err != nil {
-			return nil, fmt.Errorf("Invalid step %d in scenario %q: %w", i+1, path, err)
+	if opts.Type != string(api.InstanceTypeContainer) && opts.Type != string(api.InstanceTypeVM) {
+		return nil, fmt.Errorf("Invalid instance type %q", opts.Type)
+	}
+
+	// The default profile is used unless a list is given, which may be empty.
+	if profiles != nil && profiles != starlark.None {
+		list, ok := profiles.(*starlark.List)
+		if !ok {
+			return nil, errors.New("Invalid profiles, expected a list")
+		}
+
+		opts.Profiles = []string{}
+		for i := range list.Len() {
+			name, ok := starlark.AsString(list.Index(i))
+			if !ok {
+				return nil, errors.New("Invalid profiles, expected a list of names")
+			}
+
+			opts.Profiles = append(opts.Profiles, name)
 		}
 	}
 
-	return sc, nil
+	opts.Config, err = stringValues(config)
+	if err != nil {
+		return nil, err
+	}
+
+	if devices != nil {
+		for _, item := range devices.Items() {
+			name, isName := starlark.AsString(item[0])
+			deviceConfig, isDict := item[1].(*starlark.Dict)
+			if !isName || !isDict {
+				return nil, errors.New("Invalid devices, expected a dict of device name to configuration")
+			}
+
+			opts.Devices[name], err = stringValues(deviceConfig)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	opts.Project = run.sim.defaultProject(opts.Project)
+
+	res, err := run.sim.create(run.ctx, opts)
+	if err != nil {
+		return nil, err
+	}
+
+	return run.record(res)
 }
 
-// validate checks that a step is usable.
-func (step *scenarioStep) validate() error {
-	actions := 0
-	if step.Create != nil {
-		actions++
-
-		if step.Create.Name == "" {
-			return errors.New("An instance name is required")
-		}
+// scenarioMove implements move().
+func scenarioMove(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+	run, err := currentTest(thread, b)
+	if err != nil {
+		return nil, err
 	}
 
-	if step.Move != nil {
-		actions++
+	var name string
+	var target string
+	var projectName string
 
-		if step.Move.Instance == "" || step.Move.Target == "" {
-			return errors.New("An instance and a target are required")
-		}
+	err = starlark.UnpackArgs(b.Name(), args, kwargs, "instance", &name, "target", &target, "project?", &projectName)
+	if err != nil {
+		return nil, err
 	}
 
-	if step.Evacuate != nil {
-		actions++
-
-		if step.Evacuate.Member == "" {
-			return errors.New("A cluster member is required")
-		}
+	res, err := run.sim.move(run.ctx, run.sim.defaultProject(projectName), name, target)
+	if err != nil {
+		return nil, err
 	}
 
-	if actions != 1 {
-		return errors.New("Exactly one of create, move or evacuate is required")
-	}
-
-	expects := []placementExpect{step.Expect.placementExpect}
-	for _, expect := range step.Expect.Instances {
-		expects = append(expects, expect)
-	}
-
-	outcomes := []string{"", outcomeScriptlet, outcomeBuiltin, outcomeValidated, outcomeRejected, outcomeStays}
-	for _, expect := range expects {
-		if !slices.Contains(outcomes, expect.Outcome) {
-			return fmt.Errorf("Invalid outcome %q", expect.Outcome)
-		}
-	}
-
-	return nil
+	return run.record(res)
 }
 
-// label returns the name of a step, describing its action if it wasn't given one.
-func (step *scenarioStep) label() string {
-	if step.Name != "" {
-		return step.Name
+// scenarioEvacuate implements evacuate().
+func scenarioEvacuate(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+	run, err := currentTest(thread, b)
+	if err != nil {
+		return nil, err
 	}
 
-	switch {
-	case step.Create != nil:
-		return "create " + step.Create.Name
-	case step.Move != nil:
-		return fmt.Sprintf("move %s to %s", step.Move.Instance, step.Move.Target)
-	case step.Evacuate.Heal:
-		return "heal " + step.Evacuate.Member
+	var member string
+	var heal bool
+
+	err = starlark.UnpackArgs(b.Name(), args, kwargs, "member", &member, "heal?", &heal)
+	if err != nil {
+		return nil, err
 	}
 
-	return "evacuate " + step.Evacuate.Member
-}
+	// An evacuation is handled by the evacuated member, later actions go back to the usual one.
+	localMember := run.sim.localMember
+	results, err := run.sim.evacuate(run.ctx, member, heal)
+	run.sim.localMember = localMember
 
-// execute runs the action of a step.
-func (step *scenarioStep) execute(ctx context.Context, sim *simulator) ([]*result, error) {
-	if step.Evacuate != nil {
-		return sim.evacuate(ctx, step.Evacuate.Member, step.Evacuate.Heal)
+	if err != nil {
+		return nil, err
 	}
 
-	if step.Move != nil {
-		res, err := sim.move(ctx, sim.defaultProject(step.Move.Project), step.Move.Instance, step.Move.Target)
+	// Placements are keyed by instance name, prefixed with the project outside of the default one.
+	defaultProject := run.sim.defaultProject("")
+
+	placed := starlark.NewDict(len(results))
+	for _, res := range results {
+		value, err := run.record(res)
 		if err != nil {
 			return nil, err
 		}
 
-		return []*result{res}, nil
+		key := res.Instance
+		if res.Project != defaultProject {
+			key = res.Project + "/" + res.Instance
+		}
+
+		err = placed.SetKey(starlark.String(key), value)
+		if err != nil {
+			return nil, err
+		}
 	}
 
-	opts := createOptions{
-		Project:      sim.defaultProject(step.Create.Project),
-		Name:         step.Create.Name,
-		Type:         step.Create.Type,
-		Profiles:     step.Create.Profiles,
-		Config:       step.Create.Config,
-		Devices:      step.Create.Devices,
-		Target:       step.Create.Target,
-		Architecture: step.Create.Architecture,
-		Image:        step.Create.Image,
-	}
+	return placed, nil
+}
 
-	switch opts.Type {
-	case "":
-		opts.Type = string(api.InstanceTypeContainer)
-	case "vm":
-		opts.Type = string(api.InstanceTypeVM)
-	case string(api.InstanceTypeContainer), string(api.InstanceTypeVM):
-	default:
-		return nil, fmt.Errorf("Invalid instance type %q", opts.Type)
-	}
+// scenarioQuery wraps one of the read-only functions that placement scriptlets also have.
+func scenarioQuery(query func(provider *simProvider, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (any, error)) func(*starlark.Thread, *starlark.Builtin, starlark.Tuple, []starlark.Tuple) (starlark.Value, error) {
+	return func(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+		run, err := currentTest(thread, b)
+		if err != nil {
+			return nil, err
+		}
 
-	if opts.Config == nil {
-		opts.Config = map[string]string{}
-	}
+		value, err := query(&simProvider{sim: run.sim, res: &result{}}, b, args, kwargs)
+		if err != nil {
+			return nil, err
+		}
 
-	if opts.Devices == nil {
-		opts.Devices = map[string]map[string]string{}
+		return scriptlet.StarlarkMarshal(value)
 	}
+}
 
-	res, err := sim.create(ctx, opts)
+// scenarioAssertEq implements assert_eq().
+func scenarioAssertEq(_ *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+	var got starlark.Value
+	var want starlark.Value
+	var msg string
+
+	err := starlark.UnpackArgs(b.Name(), args, kwargs, "got", &got, "want", &want, "msg?", &msg)
 	if err != nil {
 		return nil, err
 	}
 
-	return []*result{res}, nil
+	equal, err := starlark.Equal(got, want)
+	if err != nil {
+		return nil, err
+	}
+
+	if !equal {
+		if msg != "" {
+			msg = ": " + msg
+		}
+
+		return nil, fmt.Errorf("got %s, want %s%s", got.String(), want.String(), msg)
+	}
+
+	return starlark.None, nil
 }
 
-// describe summarizes what happened to an instance.
-func (res *result) describe() string {
-	switch res.Outcome {
-	case outcomeRejected:
-		return "a rejection (" + res.Error + ")"
-	case outcomeStays:
-		return "it staying on " + res.Target
+// scenarioAssertTrue implements assert_true().
+func scenarioAssertTrue(_ *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+	var cond starlark.Value
+	var msg string
+
+	err := starlark.UnpackArgs(b.Name(), args, kwargs, "cond", &cond, "msg?", &msg)
+	if err != nil {
+		return nil, err
 	}
 
-	return fmt.Sprintf("%s (%s)", res.Target, res.Outcome)
+	if !cond.Truth() {
+		if msg == "" {
+			msg = "condition is false"
+		}
+
+		return nil, errors.New(msg)
+	}
+
+	return starlark.None, nil
 }
 
-// check returns how a placement differs from what was expected.
-func (e placementExpect) check(res *result) []string {
-	var failures []string
+// scenarioBuiltins returns what a scenario can call on top of the Starlark language.
+func scenarioBuiltins() starlark.StringDict {
+	builtins := map[string]func(*starlark.Thread, *starlark.Builtin, starlark.Tuple, []starlark.Tuple) (starlark.Value, error){
+		"create":      scenarioCreate,
+		"move":        scenarioMove,
+		"evacuate":    scenarioEvacuate,
+		"assert_eq":   scenarioAssertEq,
+		"assert_true": scenarioAssertTrue,
+		"get_instances": scenarioQuery(func(provider *simProvider, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (any, error) {
+			var projectName string
+			var location string
 
-	fail := func(format string, args ...any) {
-		failures = append(failures, fmt.Sprintf("%s/%s: expected ", res.Project, res.Instance)+fmt.Sprintf(format, args...)+", got "+res.describe())
-	}
-
-	if e.Outcome != "" && res.Outcome != e.Outcome {
-		fail("outcome %q", e.Outcome)
-	}
-
-	if e.Target != "" && res.Target != e.Target {
-		fail("target %s", e.Target)
-	}
-
-	if len(e.TargetIn) > 0 && !slices.Contains(e.TargetIn, res.Target) {
-		fail("a target among %s", strings.Join(e.TargetIn, ", "))
-	}
-
-	if slices.Contains(e.TargetNot, res.Target) {
-		fail("a target other than %s", strings.Join(e.TargetNot, ", "))
-	}
-
-	if e.Error != "" && !strings.Contains(res.Error, e.Error) {
-		fail("an error containing %q", e.Error)
-	}
-
-	return failures
-}
-
-// matches returns whether an instance reference ("name" or "project/name") designates the given instance.
-func instanceMatches(ref string, projectName string, name string) bool {
-	refProject, refName, found := strings.Cut(ref, "/")
-	if !found {
-		return ref == name
-	}
-
-	return refProject == projectName && refName == name
-}
-
-// check returns how the outcome of a step differs from what was expected.
-func (e *scenarioExpect) check(sim *simulator, results []*result) []string {
-	var failures []string
-
-	// Placements, with the per-instance expectations taking over the step wide ones.
-	seen := map[string]bool{}
-	for _, res := range results {
-		expect := e.placementExpect
-		for ref, instanceExpect := range e.Instances {
-			if instanceMatches(ref, res.Project, res.Instance) {
-				expect = instanceExpect
-				seen[ref] = true
+			err := starlark.UnpackArgs(b.Name(), args, kwargs, "project??", &projectName, "location??", &location)
+			if err != nil {
+				return nil, err
 			}
-		}
 
-		failures = append(failures, expect.check(res)...)
+			return provider.Instances(context.Background(), projectName, location)
+		}),
+		"get_instances_count": scenarioQuery(func(provider *simProvider, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (any, error) {
+			var projectName string
+			var location string
+			var pending bool
+
+			err := starlark.UnpackArgs(b.Name(), args, kwargs, "project??", &projectName, "location??", &location, "pending??", &pending)
+			if err != nil {
+				return nil, err
+			}
+
+			return provider.InstancesCount(context.Background(), projectName, location, pending)
+		}),
+		"get_cluster_members": scenarioQuery(func(provider *simProvider, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (any, error) {
+			var group string
+
+			err := starlark.UnpackArgs(b.Name(), args, kwargs, "group??", &group)
+			if err != nil {
+				return nil, err
+			}
+
+			return provider.ClusterMembers(context.Background(), group)
+		}),
+		"get_cluster_member_resources": scenarioQuery(func(provider *simProvider, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (any, error) {
+			var member string
+
+			err := starlark.UnpackArgs(b.Name(), args, kwargs, "member_name", &member)
+			if err != nil {
+				return nil, err
+			}
+
+			return provider.ClusterMemberResources(context.Background(), member)
+		}),
+		"get_cluster_member_state": scenarioQuery(func(provider *simProvider, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (any, error) {
+			var member string
+
+			err := starlark.UnpackArgs(b.Name(), args, kwargs, "member_name", &member)
+			if err != nil {
+				return nil, err
+			}
+
+			return provider.ClusterMemberState(context.Background(), member)
+		}),
+		"get_project": scenarioQuery(func(provider *simProvider, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (any, error) {
+			var name string
+
+			err := starlark.UnpackArgs(b.Name(), args, kwargs, "name", &name)
+			if err != nil {
+				return nil, err
+			}
+
+			return provider.Project(context.Background(), name)
+		}),
 	}
 
-	for ref := range e.Instances {
-		if !seen[ref] {
-			failures = append(failures, fmt.Sprintf("%s: expected a placement, but the step didn't place this instance", ref))
-		}
+	env := starlark.StringDict{}
+	for name, fn := range builtins {
+		env[name] = starlark.NewBuiltin(name, fn)
 	}
 
-	// Instance counts, with "*" covering the members which aren't listed.
-	for _, member := range sim.snap.Members {
-		expect, ok := e.Members[member.ServerName]
+	return env
+}
+
+// loadScenario compiles a scenario file and finds its settings and test functions.
+func loadScenario(path string) (*scenario, error) {
+	src, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+
+	env := scenarioBuiltins()
+
+	names := make([]string, 0, len(env))
+	for name := range env {
+		names = append(names, name)
+	}
+
+	prog, err := scriptlet.Compile(path, string(src), names)
+	if err != nil {
+		return nil, fmt.Errorf("Failed parsing scenario: %w", err)
+	}
+
+	thread := &starlark.Thread{Name: path, Print: func(_ *starlark.Thread, msg string) { fmt.Fprintln(os.Stderr, msg) }}
+
+	globals, err := prog.Init(thread, env)
+	if err != nil {
+		return nil, fmt.Errorf("Failed loading scenario: %s", describeFailure(err))
+	}
+
+	// Tests can't change the file's globals, so one can't affect another.
+	globals.Freeze()
+
+	sc := &scenario{Path: path}
+
+	settings := map[string]*string{"cluster": &sc.Cluster, "scriptlet": &sc.Scriptlet, "local_member": &sc.LocalMember}
+	for name, setting := range settings {
+		value, ok := globals[name]
 		if !ok {
-			expect, ok = e.Members["*"]
-			if !ok {
-				continue
-			}
+			continue
 		}
 
-		count := sim.instancesCount("", member.ServerName)
-		got := ", got " + instancesLabel(count)
-
-		if expect.Instances != nil && count != *expect.Instances {
-			failures = append(failures, fmt.Sprintf("member %s: expected %s%s", member.ServerName, instancesLabel(*expect.Instances), got))
+		text, ok := starlark.AsString(value)
+		if !ok {
+			return nil, fmt.Errorf("Invalid %q in scenario %q, expected a string", name, path)
 		}
 
-		if expect.MinInstances != nil && count < *expect.MinInstances {
-			failures = append(failures, fmt.Sprintf("member %s: expected at least %s%s", member.ServerName, instancesLabel(*expect.MinInstances), got))
-		}
-
-		if expect.MaxInstances != nil && count > *expect.MaxInstances {
-			failures = append(failures, fmt.Sprintf("member %s: expected at most %s%s", member.ServerName, instancesLabel(*expect.MaxInstances), got))
-		}
+		*setting = text
 	}
 
-	for name := range e.Members {
-		if name != "*" && sim.member(name) == nil {
-			failures = append(failures, fmt.Sprintf("member %s: not found in the cluster", name))
+	for name, value := range globals {
+		fn, ok := value.(*starlark.Function)
+		if !ok || !strings.HasPrefix(name, "test_") {
+			continue
 		}
+
+		if fn.NumParams() != 0 {
+			return nil, fmt.Errorf("Test function %q in scenario %q can't take arguments", name, path)
+		}
+
+		sc.Tests = append(sc.Tests, fn)
 	}
 
-	// Instances which must all be on different members.
-	locations := map[string][]string{}
-	for _, ref := range e.Apart {
-		found := false
-		for _, inst := range sim.snap.Instances {
-			if instanceMatches(ref, inst.Project, inst.Name) {
-				locations[inst.Location] = append(locations[inst.Location], ref)
-				found = true
-			}
-		}
-
-		if !found {
-			failures = append(failures, fmt.Sprintf("%s: expected to be apart from others, but the instance doesn't exist", ref))
-		}
+	if len(sc.Tests) == 0 {
+		return nil, fmt.Errorf("Scenario %q doesn't define any test_ function", path)
 	}
 
-	shared := make([]string, 0, len(locations))
-	for location, refs := range locations {
-		if len(refs) > 1 {
-			shared = append(shared, fmt.Sprintf("expected %s to be apart, but they are all on %s", strings.Join(refs, ", "), location))
-		}
-	}
+	// Run the tests in the order they are written.
+	sort.Slice(sc.Tests, func(i int, j int) bool {
+		return sc.Tests[i].Position().Line < sc.Tests[j].Position().Line
+	})
 
-	sort.Strings(shared)
-
-	return append(failures, shared...)
+	return sc, nil
 }
 
-// run plays all the steps against the simulator, which carries its state from one step to the next.
-func (sc *scenario) run(ctx context.Context, sim *simulator) []stepReport {
-	localMember := sim.localMember
-
-	reports := make([]stepReport, 0, len(sc.Steps))
-	for i := range sc.Steps {
-		step := &sc.Steps[i]
-		rep := stepReport{Name: step.label()}
-
-		results, err := step.execute(ctx, sim)
-
-		// An evacuation is handled by the evacuated member, later steps go back to the usual one.
-		sim.localMember = localMember
-
-		// A step which can't run fails on its own so that the other steps still get checked.
-		if err != nil {
-			rep.Failures = []string{"couldn't run: " + err.Error()}
-		} else {
-			rep.Results = results
-			rep.Failures = step.Expect.check(sim, results)
-		}
-
-		reports = append(reports, rep)
+// describeFailure turns a Starlark error into a message pointing at the line it came from.
+func describeFailure(err error) string {
+	var evalErr *starlark.EvalError
+	if !errors.As(err, &evalErr) {
+		return err.Error()
 	}
 
-	return reports
+	// Find the innermost frame which is in the scenario itself rather than in a builtin.
+	for i := len(evalErr.CallStack) - 1; i >= 0; i-- {
+		pos := evalErr.CallStack[i].Pos
+		if pos.Filename() != "<builtin>" && pos.Line > 0 {
+			return fmt.Sprintf("%s:%d: %s", filepath.Base(pos.Filename()), pos.Line, evalErr.Msg)
+		}
+	}
+
+	return evalErr.Msg
+}
+
+// runTest runs a test function against a simulator.
+func runTest(ctx context.Context, fn *starlark.Function, sim *simulator) testReport {
+	run := &testRun{ctx: ctx, sim: sim}
+
+	thread := &starlark.Thread{Name: fn.Name(), Print: func(_ *starlark.Thread, msg string) { run.output = append(run.output, msg) }}
+	thread.SetLocal(testRunKey, run)
+
+	rep := testReport{Name: fn.Name()}
+
+	_, err := starlark.Call(thread, fn, nil, nil)
+	if err != nil {
+		rep.Failure = describeFailure(err)
+	}
+
+	rep.Results = run.results
+	rep.Output = run.output
+
+	return rep
+}
+
+// run plays every test, each of them starting from the cluster as it was captured.
+func (sc *scenario) run(ctx context.Context, clusterPath string, scriptletSrc string, localMember string) ([]testReport, error) {
+	reports := make([]testReport, 0, len(sc.Tests))
+	for _, fn := range sc.Tests {
+		snap, err := loadSnapshot(clusterPath)
+		if err != nil {
+			return nil, err
+		}
+
+		sim, err := newSimulator(snap, scriptletSrc, localMember)
+		if err != nil {
+			return nil, err
+		}
+
+		reports = append(reports, runTest(ctx, fn, sim))
+	}
+
+	return reports, nil
 }

@@ -295,7 +295,21 @@ func (s *simulator) groupExists(name string) bool {
 
 // restrictedClusterGroups mirrors project.GetRestrictedClusterGroups.
 func restrictedClusterGroups(p *api.Project) []string {
+	if util.IsFalseOrEmpty(p.Config["restricted"]) {
+		return nil
+	}
+
 	return util.SplitNTrimSpace(p.Config["restricted.cluster.groups"], ",", -1, true)
+}
+
+// noCandidateError mirrors project.NoCandidateMemberError.
+func noCandidateError(p *api.Project) error {
+	allowedGroups := restrictedClusterGroups(p)
+	if len(allowedGroups) > 1 {
+		return fmt.Errorf("Couldn't find a cluster member for the instance, target one of the project's cluster groups: %s", strings.Join(allowedGroups, ", "))
+	}
+
+	return errors.New("Couldn't find a cluster member for the instance")
 }
 
 // isSchedulable mirrors the member state check of db.GetCandidateMembers (created and online).
@@ -422,13 +436,18 @@ func (s *simulator) checkTarget(p *api.Project, target string) (*SnapshotMember,
 	groupName, isGroup := strings.CutPrefix(target, "@")
 	allowedGroups := restrictedClusterGroups(p)
 
+	// A project restricted to a single cluster group targets it by default.
+	if target == "" && len(allowedGroups) == 1 {
+		groupName = allowedGroups[0]
+	}
+
 	if !isGroup && target != "" {
 		member := s.member(target)
 		if member == nil {
 			return nil, "", fmt.Errorf("Cluster member %q not found", target)
 		}
 
-		if util.IsTrue(p.Config["restricted"]) && len(allowedGroups) > 0 {
+		if len(allowedGroups) > 0 {
 			allowed := slices.ContainsFunc(member.Groups, func(name string) bool {
 				return slices.Contains(allowedGroups, name)
 			})
@@ -442,7 +461,7 @@ func (s *simulator) checkTarget(p *api.Project, target string) (*SnapshotMember,
 	}
 
 	if groupName != "" {
-		if !util.IsFalseOrEmpty(p.Config["restricted"]) && len(allowedGroups) > 0 && !slices.Contains(allowedGroups, groupName) {
+		if len(allowedGroups) > 0 && !slices.Contains(allowedGroups, groupName) {
 			return nil, "", fmt.Errorf("Project isn't allowed to use this cluster group: %q", groupName)
 		}
 
@@ -874,7 +893,7 @@ func (s *simulator) create(ctx context.Context, opts createOptions) (*result, er
 		res.Target = candidates[0].ServerName
 		res.Detail = s.fallbackDetail()
 	default:
-		res.reject(errors.New("Couldn't find a cluster member for the instance"))
+		res.reject(noCandidateError(p))
 		return res, nil
 	}
 
@@ -1002,7 +1021,7 @@ func (s *simulator) move(ctx context.Context, projectName string, name string, t
 		}
 
 		if res.Target == "" {
-			res.reject(errors.New("Couldn't find a cluster member for the instance"))
+			res.reject(noCandidateError(p))
 			return res, nil
 		}
 	}

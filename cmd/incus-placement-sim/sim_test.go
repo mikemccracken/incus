@@ -142,19 +142,25 @@ func TestCommittedMemoryScriptlet(t *testing.T) {
 }
 
 func TestScenario(t *testing.T) {
-	sc, err := loadScenario("testdata/scenario.yaml")
+	sc, err := loadScenario("testdata/scenario.star")
 	require.NoError(t, err)
+	require.Equal(t, "spread.star", sc.Scriptlet)
+	require.Len(t, sc.Tests, 3)
 
 	// The scenario was written for the scriptlet it names.
-	for _, rep := range sc.run(context.Background(), testSimulator(t, testScriptlet(t))) {
-		require.Empty(t, rep.Failures, rep.Name)
+	reports, err := sc.run(context.Background(), "testdata/cluster.yaml", testScriptlet(t), "")
+	require.NoError(t, err)
+
+	for _, rep := range reports {
+		require.Empty(t, rep.Failure, rep.Name)
 	}
 
 	// The built-in placement doesn't keep the database instances apart.
-	reports := sc.run(context.Background(), testSimulator(t, ""))
-	require.Len(t, reports, len(sc.Steps))
-	require.Contains(t, reports[1].Failures, `default/db3: expected outcome "rejected", got node3 (builtin)`)
-	require.Contains(t, reports[2].Failures, `couldn't run: Instance "db3" already exists`)
+	reports, err = sc.run(context.Background(), "testdata/cluster.yaml", "", "")
+	require.NoError(t, err)
+	require.Equal(t, `scenario.star:25: got "builtin", want "scriptlet"`, reports[0].Failure)
+	require.Equal(t, `scenario.star:44: got "validated", want "rejected"`, reports[1].Failure)
+	require.Empty(t, reports[2].Failure)
 }
 
 func TestInstanceResources(t *testing.T) {
