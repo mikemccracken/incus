@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"io"
 	"os"
 	"testing"
 
@@ -139,6 +140,45 @@ func TestCommittedMemoryScriptlet(t *testing.T) {
 	res, err = sim.create(context.Background(), opts)
 	require.NoError(t, err)
 	require.Equal(t, outcomeRejected, res.Outcome)
+}
+
+func TestDocument(t *testing.T) {
+	sim := testSimulator(t, testScriptlet(t))
+
+	_, err := sim.evacuate(context.Background(), "node2", false)
+	require.NoError(t, err)
+
+	_, err = sim.create(context.Background(), createOptions{Project: "default", Name: "db3", Type: "virtual-machine", Profiles: []string{"default", "db"}})
+	require.NoError(t, err)
+
+	run := sim.document("spread.star", "spread.star")
+	require.Len(t, run.Cluster.Members, 4)
+	require.Equal(t, "Online", run.Initial.Members["node2"].Status)
+	require.Equal(t, memberState{Status: "Evacuated", Instances: 1, CommittedCPUs: 2, CommittedMemory: 2 * 1024 * 1024 * 1024}, run.Final.Members["node2"])
+	require.Len(t, run.Actions, 2)
+
+	// The evacuation moves db2, with the scriptlet's activity and the resulting state recorded.
+	evacuation := run.Actions[0]
+	require.Equal(t, "evacuate", evacuation.Type)
+	require.Len(t, evacuation.Placements, 2)
+
+	db2 := evacuation.Placements[0]
+	require.Equal(t, []docCandidate{{Member: "node3", Instances: 1}, {Member: "node1", Instances: 3}}, db2.Candidates)
+	require.Equal(t, &docChange{Type: "move", From: "node2", To: "node3"}, db2.Change)
+	require.Equal(t, uint64(8*1024*1024*1024), db2.Resources.Memory)
+	require.Equal(t, 2, db2.Members["node3"].Instances)
+	require.Equal(t, traceEntry{Kind: traceCall, Message: `set_target(member_name="node3")`, Function: "set_target", Args: map[string]any{"member_name": "node3"}, Member: "node3"}, db2.Trace[len(db2.Trace)-1])
+
+	// Instances which stay and rejected ones don't move, and placements are numbered across actions.
+	require.Nil(t, evacuation.Placements[1].Change)
+
+	db3 := run.Actions[1].Placements[0]
+	require.Equal(t, 2, db3.Index)
+	require.Equal(t, outcomeRejected, db3.Outcome)
+	require.Nil(t, db3.Change)
+
+	// The whole document can be encoded.
+	require.NoError(t, writeDocument(io.Discard, "run", []docRun{run}))
 }
 
 func TestInstanceResources(t *testing.T) {

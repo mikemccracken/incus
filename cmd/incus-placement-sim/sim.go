@@ -56,6 +56,15 @@ type traceEntry struct {
 	Member   string            `json:"member,omitempty"`
 }
 
+// label returns the short name shown in front of a trace entry.
+func (e traceEntry) label() string {
+	if e.Kind == traceLog {
+		return e.Level
+	}
+
+	return e.Kind
+}
+
 // Reasons for a cluster member not to be a placement candidate.
 const (
 	excludedStatus        = "status"
@@ -350,6 +359,19 @@ func (s *simulator) project(name string) (*api.Project, error) {
 	}
 
 	return nil, fmt.Errorf("Project %q not found, snapshot has: %s", name, strings.Join(names, ", "))
+}
+
+// defaultProject picks the project to use when none was requested.
+func (s *simulator) defaultProject(name string) string {
+	if name != "" {
+		return name
+	}
+
+	if len(s.snap.Projects) == 1 {
+		return s.snap.Projects[0].Name
+	}
+
+	return api.ProjectDefaultName
 }
 
 // instance returns the named instance.

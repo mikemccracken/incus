@@ -48,6 +48,10 @@ func main() {
 	captureCmd := cmdCapture{global: &globalCmd}
 	app.AddCommand(captureCmd.command())
 
+	// run sub-command.
+	runCmd := cmdRun{global: &globalCmd}
+	app.AddCommand(runCmd.command())
+
 	// validate sub-command.
 	validateCmd := cmdValidate{global: &globalCmd}
 	app.AddCommand(validateCmd.command())
