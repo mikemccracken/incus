@@ -1,0 +1,291 @@
+# Sample cluster used by the tests and as an example of the snapshot format.
+# A real snapshot is produced with "incus-placement-sim capture".
+version: 1
+captured_at: 2026-11-18T10:00:00Z
+server:
+  version: "7.6"
+  config:
+    cluster.offline_threshold: "20"
+members:
+- server_name: node1
+  url: /1.0/cluster/members/node1
+  database: true
+  status: Online
+  message: Fully operational
+  architecture: x86_64
+  roles: []
+  failure_domain: az1
+  description: ""
+  config: {}
+  groups: [default]
+  resources:
+    cpu:
+      architecture: x86_64
+      total: 16
+    memory:
+      used: 42949672960
+      total: 68719476736
+    load:
+      average1min: 4.0
+      average5min: 4.0
+      average10min: 4.0
+      processes: 400
+  state:
+    sysinfo:
+      uptime: 864000
+      load_averages: [4.0, 4.0, 4.0]
+      total_ram: 68719476736
+      free_ram: 25769803776
+      processes: 400
+    storage_pools:
+      local:
+        space: {used: 107374182400, total: 1073741824000}
+        inodes: {used: 0, total: 0}
+- server_name: node2
+  url: /1.0/cluster/members/node2
+  database: true
+  status: Online
+  message: Fully operational
+  architecture: x86_64
+  roles: []
+  failure_domain: az1
+  description: ""
+  config: {}
+  groups: [default]
+  resources:
+    cpu:
+      architecture: x86_64
+      total: 16
+    memory:
+      used: 21474836480
+      total: 68719476736
+    load:
+      average1min: 2.0
+      average5min: 2.0
+      average10min: 2.0
+      processes: 400
+  state:
+    sysinfo:
+      uptime: 864000
+      load_averages: [2.0, 2.0, 2.0]
+      total_ram: 68719476736
+      free_ram: 47244640256
+      processes: 400
+    storage_pools:
+      local:
+        space: {used: 107374182400, total: 1073741824000}
+        inodes: {used: 0, total: 0}
+- server_name: node3
+  url: /1.0/cluster/members/node3
+  database: true
+  status: Online
+  message: Fully operational
+  architecture: x86_64
+  roles: []
+  failure_domain: az2
+  description: ""
+  config: {}
+  groups: [default, gpu]
+  resources:
+    cpu:
+      architecture: x86_64
+      total: 32
+    memory:
+      used: 32212254720
+      total: 137438953472
+    load:
+      average1min: 3.0
+      average5min: 3.0
+      average10min: 3.0
+      processes: 400
+  state:
+    sysinfo:
+      uptime: 864000
+      load_averages: [3.0, 3.0, 3.0]
+      total_ram: 137438953472
+      free_ram: 105226698752
+      processes: 400
+    storage_pools:
+      local:
+        space: {used: 107374182400, total: 1073741824000}
+        inodes: {used: 0, total: 0}
+- server_name: node4
+  url: /1.0/cluster/members/node4
+  database: false
+  status: Online
+  message: Fully operational
+  architecture: x86_64
+  roles: []
+  failure_domain: az2
+  description: ""
+  config: {scheduler.instance: group}
+  groups: [gpu]
+  resources:
+    cpu:
+      architecture: x86_64
+      total: 32
+    memory:
+      used: 10737418240
+      total: 137438953472
+    load:
+      average1min: 1.0
+      average5min: 1.0
+      average10min: 1.0
+      processes: 400
+  state:
+    sysinfo:
+      uptime: 864000
+      load_averages: [1.0, 1.0, 1.0]
+      total_ram: 137438953472
+      free_ram: 126701535232
+      processes: 400
+    storage_pools:
+      local:
+        space: {used: 107374182400, total: 1073741824000}
+        inodes: {used: 0, total: 0}
+groups:
+- name: default
+  description: Default cluster group
+  members: [node1, node2, node3]
+- name: gpu
+  description: Members with GPUs
+  members: [node3, node4]
+projects:
+- name: default
+  description: Default project
+  config:
+    features.images: "true"
+    features.profiles: "true"
+- name: restricted
+  description: Project limited to the gpu group
+  config:
+    features.profiles: "false"
+    restricted: "true"
+    restricted.cluster.groups: gpu
+profiles:
+- name: default
+  project: default
+  description: Default profile
+  config: {}
+  devices:
+    eth0: {type: nic, network: incusbr0, name: eth0}
+    root: {type: disk, path: /, pool: local}
+- name: small
+  project: default
+  description: Small instances
+  config:
+    limits.cpu: "2"
+    limits.memory: 2GiB
+  devices: {}
+- name: db
+  project: default
+  description: Database instances
+  config:
+    limits.cpu: "4"
+    limits.memory: 8GiB
+    user.ha-group: db
+  devices:
+    root: {type: disk, path: /, pool: local, size: 50GiB}
+instances:
+- name: web1
+  project: default
+  location: node1
+  type: container
+  architecture: x86_64
+  status: Running
+  status_code: 103
+  profiles: [default, small]
+  config: {}
+  devices: {}
+  expanded_config:
+    limits.cpu: "2"
+    limits.memory: 2GiB
+  expanded_devices:
+    eth0: {type: nic, network: incusbr0, name: eth0}
+    root: {type: disk, path: /, pool: local}
+- name: web2
+  project: default
+  location: node1
+  type: container
+  architecture: x86_64
+  status: Running
+  status_code: 103
+  profiles: [default, small]
+  config: {}
+  devices: {}
+  expanded_config:
+    limits.cpu: "2"
+    limits.memory: 2GiB
+  expanded_devices:
+    eth0: {type: nic, network: incusbr0, name: eth0}
+    root: {type: disk, path: /, pool: local}
+- name: db1
+  project: default
+  location: node1
+  type: virtual-machine
+  architecture: x86_64
+  status: Running
+  status_code: 103
+  profiles: [default, db]
+  config: {}
+  devices: {}
+  expanded_config:
+    limits.cpu: "4"
+    limits.memory: 8GiB
+    user.ha-group: db
+  expanded_devices:
+    eth0: {type: nic, network: incusbr0, name: eth0}
+    root: {type: disk, path: /, pool: local, size: 50GiB}
+- name: db2
+  project: default
+  location: node2
+  type: virtual-machine
+  architecture: x86_64
+  status: Running
+  status_code: 103
+  profiles: [default, db]
+  config: {}
+  devices: {}
+  expanded_config:
+    limits.cpu: "4"
+    limits.memory: 8GiB
+    user.ha-group: db
+  expanded_devices:
+    eth0: {type: nic, network: incusbr0, name: eth0}
+    root: {type: disk, path: /, pool: local, size: 50GiB}
+- name: cache1
+  project: default
+  location: node2
+  type: container
+  architecture: x86_64
+  status: Running
+  status_code: 103
+  profiles: [default, small]
+  config:
+    cluster.evacuate: stop
+  devices: {}
+  expanded_config:
+    limits.cpu: "2"
+    limits.memory: 2GiB
+    cluster.evacuate: stop
+  expanded_devices:
+    eth0: {type: nic, network: incusbr0, name: eth0}
+    root: {type: disk, path: /, pool: local}
+- name: gpu1
+  project: default
+  location: node3
+  type: virtual-machine
+  architecture: x86_64
+  status: Running
+  status_code: 103
+  profiles: [default, small]
+  config:
+    volatile.cluster.group: gpu
+  devices: {}
+  expanded_config:
+    limits.cpu: "2"
+    limits.memory: 2GiB
+    volatile.cluster.group: gpu
+  expanded_devices:
+    eth0: {type: nic, network: incusbr0, name: eth0}
+    root: {type: disk, path: /, pool: local}

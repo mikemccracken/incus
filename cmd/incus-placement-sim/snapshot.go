@@ -1,6 +1,8 @@
 package main
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"time"
@@ -52,6 +54,31 @@ type SnapshotMember struct {
 
 	Resources *api.Resources          `yaml:"resources,omitempty"`
 	State     *api.ClusterMemberState `yaml:"state,omitempty"`
+}
+
+// loadSnapshot reads a snapshot file.
+func loadSnapshot(path string) (*Snapshot, error) {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+
+	snap := &Snapshot{}
+
+	err = yaml.Unmarshal(content, snap)
+	if err != nil {
+		return nil, fmt.Errorf("Failed parsing snapshot %q: %w", path, err)
+	}
+
+	if snap.Version != snapshotVersion {
+		return nil, fmt.Errorf("Unsupported snapshot version %d in %q", snap.Version, path)
+	}
+
+	if len(snap.Members) == 0 {
+		return nil, errors.New("Snapshot doesn't contain any cluster member")
+	}
+
+	return snap, nil
 }
 
 // write stores the snapshot at the given path, using standard output for "-".
