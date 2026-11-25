@@ -2,495 +2,331 @@ package scriptlet
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net/http"
 	"slices"
-
-	"go.starlark.net/starlark"
 
 	"github.com/lxc/incus/v7/internal/server/cluster"
 	"github.com/lxc/incus/v7/internal/server/db"
 	dbCluster "github.com/lxc/incus/v7/internal/server/db/cluster"
 	internalInstance "github.com/lxc/incus/v7/internal/server/instance"
-	scriptletLoad "github.com/lxc/incus/v7/internal/server/scriptlet/load"
-	"github.com/lxc/incus/v7/internal/server/scriptlet/log"
+	"github.com/lxc/incus/v7/internal/server/scriptlet/placement"
 	"github.com/lxc/incus/v7/internal/server/state"
 	"github.com/lxc/incus/v7/shared/api"
 	apiScriptlet "github.com/lxc/incus/v7/shared/api/scriptlet"
 	"github.com/lxc/incus/v7/shared/logger"
 	"github.com/lxc/incus/v7/shared/resources"
-	"github.com/lxc/incus/v7/shared/scriptlet"
 )
 
-// InstancePlacementRun runs the instance placement scriptlet and returns the chosen cluster member target.
-func InstancePlacementRun(ctx context.Context, l logger.Logger, s *state.State, req *apiScriptlet.InstancePlacement, candidateMembers []db.NodeInfo, leaderAddress string) (*db.NodeInfo, error) {
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+// instancePlacementProvider provides the instance placement scriptlet with data from the running cluster.
+type instancePlacementProvider struct {
+	s                *state.State
+	candidateMembers []db.NodeInfo
+	leaderAddress    string
+}
 
-	logFunc := log.CreateLogger(l, "Instance placement scriptlet")
+// LocalMember returns the name of the local cluster member.
+func (p *instancePlacementProvider) LocalMember() string {
+	return p.s.ServerName
+}
 
-	var targetMember *db.NodeInfo
-
-	setTargetFunc := func(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
-		var memberName string
-
-		err := starlark.UnpackArgs(b.Name(), args, kwargs, "member_name", &memberName)
-		if err != nil {
-			return nil, err
+// candidateMember returns the candidate member with the given name.
+func (p *instancePlacementProvider) candidateMember(memberName string) (*db.NodeInfo, error) {
+	for i := range p.candidateMembers {
+		if p.candidateMembers[i].Name == memberName {
+			return &p.candidateMembers[i], nil
 		}
-
-		for i := range candidateMembers {
-			if candidateMembers[i].Name == memberName {
-				targetMember = &candidateMembers[i]
-				break
-			}
-		}
-
-		if targetMember == nil {
-			l.Error("Instance placement scriptlet set invalid member target", logger.Ctx{"member": memberName})
-			return nil, fmt.Errorf("Invalid member name: %s", memberName)
-		}
-
-		l.Info("Instance placement scriptlet set member target", logger.Ctx{"member": targetMember.Name})
-
-		return starlark.None, nil
 	}
 
-	getClusterMemberResourcesFunc := func(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
-		var memberName string
+	return nil, fmt.Errorf("Invalid member name: %s", memberName)
+}
 
-		err := starlark.UnpackArgs(b.Name(), args, kwargs, "member_name", &memberName)
-		if err != nil {
-			return nil, err
-		}
-
-		var res *api.Resources
-
-		// Get the local resource usage.
-		if memberName == s.ServerName {
-			res, err = resources.GetResources()
-			if err != nil {
-				return nil, err
-			}
-		} else {
-			// Get remote member resource usage.
-			var targetMember *db.NodeInfo
-			for i := range candidateMembers {
-				if candidateMembers[i].Name == memberName {
-					targetMember = &candidateMembers[i]
-					break
-				}
-			}
-
-			if targetMember == nil {
-				return nil, fmt.Errorf("Invalid member name: %s", memberName)
-			}
-
-			client, err := cluster.Connect(targetMember.Address, s.Endpoints.NetworkCert(), s.ServerCert(), nil, true)
-			if err != nil {
-				return nil, err
-			}
-
-			res, err = client.GetServerResources()
-			if err != nil {
-				return nil, err
-			}
-		}
-
-		rv, err := scriptlet.StarlarkMarshal(res)
-		if err != nil {
-			return nil, fmt.Errorf("Marshalling cluster member resources for %q failed: %w", memberName, err)
-		}
-
-		return rv, nil
+// ClusterMemberResources returns the hardware resources of a cluster member.
+func (p *instancePlacementProvider) ClusterMemberResources(ctx context.Context, memberName string) (*api.Resources, error) {
+	// Get the local resource usage.
+	if memberName == p.s.ServerName {
+		return resources.GetResources()
 	}
 
-	getClusterMemberStateFunc := func(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
-		var memberName string
-
-		err := starlark.UnpackArgs(b.Name(), args, kwargs, "member_name", &memberName)
-		if err != nil {
-			return nil, err
-		}
-
-		var memberState *api.ClusterMemberState
-
-		// Get the local resource usage.
-		if memberName == s.ServerName {
-			memberState, err = cluster.MemberState(ctx, s, memberName)
-			if err != nil {
-				return nil, err
-			}
-		} else {
-			// Get remote member resource usage.
-			var targetMember *db.NodeInfo
-			for i := range candidateMembers {
-				if candidateMembers[i].Name == memberName {
-					targetMember = &candidateMembers[i]
-					break
-				}
-			}
-
-			if targetMember == nil {
-				return nil, fmt.Errorf("Invalid member name: %s", memberName)
-			}
-
-			client, err := cluster.Connect(targetMember.Address, s.Endpoints.NetworkCert(), s.ServerCert(), nil, true)
-			if err != nil {
-				return nil, err
-			}
-
-			memberState, _, err = client.GetClusterMemberState(memberName)
-			if err != nil {
-				return nil, err
-			}
-		}
-
-		rv, err := scriptlet.StarlarkMarshal(memberState)
-		if err != nil {
-			return nil, fmt.Errorf("Marshalling cluster member state for %q failed: %w", memberName, err)
-		}
-
-		return rv, nil
+	// Get remote member resource usage.
+	targetMember, err := p.candidateMember(memberName)
+	if err != nil {
+		return nil, err
 	}
 
-	getInstanceResourcesFunc := func(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+	client, err := cluster.Connect(targetMember.Address, p.s.Endpoints.NetworkCert(), p.s.ServerCert(), nil, true)
+	if err != nil {
+		return nil, err
+	}
+
+	return client.GetServerResources()
+}
+
+// ClusterMemberState returns the state of a cluster member.
+func (p *instancePlacementProvider) ClusterMemberState(ctx context.Context, memberName string) (*api.ClusterMemberState, error) {
+	// Get the local member state.
+	if memberName == p.s.ServerName {
+		return cluster.MemberState(ctx, p.s, memberName)
+	}
+
+	// Get remote member state.
+	targetMember, err := p.candidateMember(memberName)
+	if err != nil {
+		return nil, err
+	}
+
+	client, err := cluster.Connect(targetMember.Address, p.s.Endpoints.NetworkCert(), p.s.ServerCert(), nil, true)
+	if err != nil {
+		return nil, err
+	}
+
+	memberState, _, err := client.GetClusterMemberState(memberName)
+	if err != nil {
+		return nil, err
+	}
+
+	return memberState, nil
+}
+
+// InstanceResources returns the resources required by the instance being placed.
+func (p *instancePlacementProvider) InstanceResources(req *apiScriptlet.InstancePlacement) (*apiScriptlet.InstanceResources, error) {
+	usageCPU, usageMemory, usageDisk, err := internalInstance.ResourceUsage(req.Config, req.Devices, req.Type)
+	if err != nil {
+		return nil, err
+	}
+
+	return &apiScriptlet.InstanceResources{
+		CPUCores:     uint64(usageCPU),
+		MemorySize:   uint64(usageMemory),
+		RootDiskSize: uint64(usageDisk),
+	}, nil
+}
+
+// Instances returns the instances matching the optional project and location filters.
+func (p *instancePlacementProvider) Instances(ctx context.Context, project string, location string) ([]api.Instance, error) {
+	instanceList := []api.Instance{}
+
+	err := p.s.DB.Cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
+		var objects []dbCluster.Instance
 		var err error
-		var res apiScriptlet.InstanceResources
 
-		usageCPU, usageMemory, usageDisk, err := internalInstance.ResourceUsage(req.Config, req.Devices, req.Type)
-		if err != nil {
-			return nil, fmt.Errorf("Failed to calculate instance resource usage: %w", err)
-		}
+		if project != "" || location != "" {
+			// Prepare a filter.
+			filter := dbCluster.InstanceFilter{}
 
-		res.CPUCores = uint64(usageCPU)
-		res.MemorySize = uint64(usageMemory)
-		res.RootDiskSize = uint64(usageDisk)
-
-		rv, err := scriptlet.StarlarkMarshal(res)
-		if err != nil {
-			return nil, fmt.Errorf("Marshalling instance resources failed: %w", err)
-		}
-
-		return rv, nil
-	}
-
-	getInstancesFunc := func(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
-		var project string
-		var location string
-
-		err := starlark.UnpackArgs(b.Name(), args, kwargs, "project??", &project, "location??", &location)
-		if err != nil {
-			return nil, err
-		}
-
-		instanceList := []api.Instance{}
-
-		err = s.DB.Cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
-			var objects []dbCluster.Instance
-
-			if project != "" || location != "" {
-				// Prepare a filter.
-				filter := dbCluster.InstanceFilter{}
-
-				if project != "" {
-					filter.Project = &project
-				}
-
-				if location != "" {
-					filter.Node = &location
-				}
-
-				// Get instances based on Project and/or Location filters.
-				objects, err = dbCluster.GetInstances(ctx, tx.Tx(), filter)
-				if err != nil {
-					return err
-				}
-			} else {
-				// Get all instances.
-				objects, err = dbCluster.GetInstances(ctx, tx.Tx())
-				if err != nil {
-					return err
-				}
+			if project != "" {
+				filter.Project = &project
 			}
 
-			objectIDs := make([]int, 0, len(objects))
-			for _, obj := range objects {
-				objectIDs = append(objectIDs, obj.ID)
+			if location != "" {
+				filter.Node = &location
 			}
 
-			// Load everything in bulk, per instance queries are too slow on a large cluster.
-			objectConfigs, err := dbCluster.GetConfig(ctx, tx.Tx(), "instances", "instance", dbCluster.ConfigFilter{ReferenceID: objectIDs})
+			// Get instances based on Project and/or Location filters.
+			objects, err = dbCluster.GetInstances(ctx, tx.Tx(), filter)
 			if err != nil {
 				return err
 			}
-
-			objectDevices, err := dbCluster.GetDevices(ctx, tx.Tx(), "instances", "instance", dbCluster.DeviceFilter{ReferenceID: objectIDs})
+		} else {
+			// Get all instances.
+			objects, err = dbCluster.GetInstances(ctx, tx.Tx())
 			if err != nil {
 				return err
 			}
-
-			objectProfiles, err := dbCluster.GetAllInstanceProfiles(ctx, tx.Tx())
-			if err != nil {
-				return err
-			}
-
-			profilesByID := map[int]dbCluster.Profile{}
-			for _, obj := range objects {
-				for _, profile := range objectProfiles[obj.ID] {
-					profilesByID[profile.ID] = profile
-				}
-			}
-
-			profiles := make([]dbCluster.Profile, 0, len(profilesByID))
-			for _, profile := range profilesByID {
-				profiles = append(profiles, profile)
-			}
-
-			profileConfigs, err := dbCluster.GetReferencedProfileConfigs(ctx, tx.Tx(), profiles)
-			if err != nil {
-				return err
-			}
-
-			profileDevices, err := dbCluster.GetReferencedProfileDevices(ctx, tx.Tx(), profiles)
-			if err != nil {
-				return err
-			}
-
-			// Convert the []Instances into []api.Instances.
-			for _, obj := range objects {
-				instance, err := obj.ToAPI(ctx, tx.Tx(), objectConfigs, objectDevices, objectProfiles, profileConfigs, profileDevices)
-				if err != nil {
-					return err
-				}
-
-				instanceList = append(instanceList, *instance)
-			}
-
-			// Account for moves that have been decided but not completed yet.
-			for _, placement := range instancePlacementPending(project) {
-				isPlacement := func(inst api.Instance) bool {
-					return inst.Project == placement.project && inst.Name == placement.name
-				}
-
-				if location == "" {
-					for i := range instanceList {
-						if isPlacement(instanceList[i]) {
-							instanceList[i].Location = placement.target
-						}
-					}
-
-					continue
-				}
-
-				if placement.target != location {
-					instanceList = slices.DeleteFunc(instanceList, isPlacement)
-					continue
-				}
-
-				obj, err := dbCluster.GetInstance(ctx, tx.Tx(), placement.project, placement.name)
-				if api.StatusErrorCheck(err, http.StatusNotFound) {
-					continue
-				}
-
-				if err != nil {
-					return err
-				}
-
-				devices, err := dbCluster.GetDevices(ctx, tx.Tx(), "instances", "instance", dbCluster.DeviceFilter{ReferenceID: []int{obj.ID}})
-				if err != nil {
-					return err
-				}
-
-				instance, err := obj.ToAPI(ctx, tx.Tx(), nil, devices, nil, nil, nil)
-				if err != nil {
-					return err
-				}
-
-				instance.Location = placement.target
-				instanceList = append(instanceList, *instance)
-			}
-
-			return nil
-		})
-		if err != nil {
-			return nil, err
 		}
 
-		rv, err := scriptlet.StarlarkMarshal(instanceList)
-		if err != nil {
-			return nil, fmt.Errorf("Marshalling instances failed: %w", err)
+		objectIDs := make([]int, 0, len(objects))
+		for _, obj := range objects {
+			objectIDs = append(objectIDs, obj.ID)
 		}
 
-		return rv, nil
-	}
-
-	getInstancesCountFunc := func(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
-		var projectName string
-		var locationName string
-		var includePending bool
-
-		err := starlark.UnpackArgs(b.Name(), args, kwargs, "project??", &projectName, "location??", &locationName, "pending??", &includePending)
+		// Load everything in bulk, per instance queries are too slow on a large cluster.
+		objectConfigs, err := dbCluster.GetConfig(ctx, tx.Tx(), "instances", "instance", dbCluster.ConfigFilter{ReferenceID: objectIDs})
 		if err != nil {
-			return nil, err
-		}
-
-		var count int
-
-		err = s.DB.Cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
-			count, err = tx.GetInstancesCount(ctx, projectName, locationName, includePending)
 			return err
-		})
+		}
+
+		objectDevices, err := dbCluster.GetDevices(ctx, tx.Tx(), "instances", "instance", dbCluster.DeviceFilter{ReferenceID: objectIDs})
 		if err != nil {
-			return nil, err
+			return err
+		}
+
+		objectProfiles, err := dbCluster.GetAllInstanceProfiles(ctx, tx.Tx())
+		if err != nil {
+			return err
+		}
+
+		profilesByID := map[int]dbCluster.Profile{}
+		for _, obj := range objects {
+			for _, profile := range objectProfiles[obj.ID] {
+				profilesByID[profile.ID] = profile
+			}
+		}
+
+		profiles := make([]dbCluster.Profile, 0, len(profilesByID))
+		for _, profile := range profilesByID {
+			profiles = append(profiles, profile)
+		}
+
+		profileConfigs, err := dbCluster.GetReferencedProfileConfigs(ctx, tx.Tx(), profiles)
+		if err != nil {
+			return err
+		}
+
+		profileDevices, err := dbCluster.GetReferencedProfileDevices(ctx, tx.Tx(), profiles)
+		if err != nil {
+			return err
+		}
+
+		// Convert the []Instances into []api.Instances.
+		for _, obj := range objects {
+			instance, err := obj.ToAPI(ctx, tx.Tx(), objectConfigs, objectDevices, objectProfiles, profileConfigs, profileDevices)
+			if err != nil {
+				return err
+			}
+
+			instanceList = append(instanceList, *instance)
 		}
 
 		// Account for moves that have been decided but not completed yet.
-		if locationName != "" {
-			for _, placement := range instancePlacementPending(projectName) {
-				if placement.target == locationName {
-					count++
-				} else if placement.source == locationName {
-					count--
-				}
-			}
-		}
-
-		rv, err := scriptlet.StarlarkMarshal(count)
-		if err != nil {
-			return nil, fmt.Errorf("Marshalling instance count failed: %w", err)
-		}
-
-		return rv, nil
-	}
-
-	getClusterMembersFunc := func(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
-		var group string
-		var allMembers []db.NodeInfo
-
-		err := starlark.UnpackArgs(b.Name(), args, kwargs, "group??", &group)
-		if err != nil {
-			return nil, err
-		}
-
-		err = s.DB.Cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
-			allMembers, err = tx.GetNodes(ctx)
-			if err != nil {
-				return err
+		for _, pending := range instancePlacementPending(project) {
+			isPlacement := func(inst api.Instance) bool {
+				return inst.Project == pending.project && inst.Name == pending.name
 			}
 
-			allMembers, err = tx.GetCandidateMembers(ctx, allMembers, nil, group, nil, s.GlobalConfig.OfflineThreshold())
-			if err != nil {
-				return err
-			}
-
-			return nil
-		})
-		if err != nil {
-			return nil, err
-		}
-
-		var raftNodes []db.RaftNode
-		err = s.DB.Node.Transaction(ctx, func(ctx context.Context, tx *db.NodeTx) error {
-			raftNodes, err = tx.GetRaftNodes(ctx)
-			if err != nil {
-				return fmt.Errorf("Failed loading RAFT nodes: %w", err)
-			}
-
-			return nil
-		})
-		if err != nil {
-			return nil, err
-		}
-
-		allMembersInfo := make([]*api.ClusterMember, 0, len(allMembers))
-		err = s.DB.Cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
-			failureDomains, err := tx.GetFailureDomainsNames(ctx)
-			if err != nil {
-				return fmt.Errorf("Failed loading failure domains names: %w", err)
-			}
-
-			memberFailureDomains, err := tx.GetNodesFailureDomains(ctx)
-			if err != nil {
-				return fmt.Errorf("Failed loading member failure domains: %w", err)
-			}
-
-			maxVersion, err := tx.GetNodeMaxVersion(ctx)
-			if err != nil {
-				return fmt.Errorf("Failed getting max member version: %w", err)
-			}
-
-			args := db.NodeInfoArgs{
-				LeaderAddress:        leaderAddress,
-				FailureDomains:       failureDomains,
-				MemberFailureDomains: memberFailureDomains,
-				OfflineThreshold:     s.GlobalConfig.OfflineThreshold(),
-				MaxMemberVersion:     maxVersion,
-				RaftNodes:            raftNodes,
-			}
-
-			for i := range allMembers {
-				candidateMemberInfo, err := db.APINodeInfo{NodeInfo: allMembers[i]}.ToAPI(ctx, tx, args)
-				if err != nil {
-					return err
+			if location == "" {
+				for i := range instanceList {
+					if isPlacement(instanceList[i]) {
+						instanceList[i].Location = pending.target
+					}
 				}
 
-				allMembersInfo = append(allMembersInfo, candidateMemberInfo)
+				continue
 			}
 
-			return nil
-		})
-		if err != nil {
-			return nil, err
-		}
+			if pending.target != location {
+				instanceList = slices.DeleteFunc(instanceList, isPlacement)
+				continue
+			}
 
-		rv, err := scriptlet.StarlarkMarshal(allMembersInfo)
-		if err != nil {
-			return nil, fmt.Errorf("Marshalling cluster members failed: %w", err)
-		}
+			obj, err := dbCluster.GetInstance(ctx, tx.Tx(), pending.project, pending.name)
+			if api.StatusErrorCheck(err, http.StatusNotFound) {
+				continue
+			}
 
-		return rv, nil
-	}
-
-	getProjectFunc := func(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
-		var name string
-
-		err := starlark.UnpackArgs(b.Name(), args, kwargs, "name??", &name)
-		if err != nil {
-			return nil, err
-		}
-
-		var p *api.Project
-
-		err = s.DB.Cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
-			dbProject, err := dbCluster.GetProject(ctx, tx.Tx(), name)
 			if err != nil {
 				return err
 			}
 
-			p, err = dbProject.ToAPI(ctx, tx.Tx())
+			devices, err := dbCluster.GetDevices(ctx, tx.Tx(), "instances", "instance", dbCluster.DeviceFilter{ReferenceID: []int{obj.ID}})
 			if err != nil {
 				return err
 			}
 
-			return nil
-		})
-		if err != nil {
-			return nil, err
+			instance, err := obj.ToAPI(ctx, tx.Tx(), nil, devices, nil, nil, nil)
+			if err != nil {
+				return err
+			}
+
+			instance.Location = pending.target
+			instanceList = append(instanceList, *instance)
 		}
 
-		rv, err := scriptlet.StarlarkMarshal(p)
-		if err != nil {
-			return nil, fmt.Errorf("Marshalling project failed: %w", err)
-		}
-
-		return rv, nil
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 
-	var err error
+	return instanceList, nil
+}
+
+// InstancesCount returns the number of instances matching the optional project and location filters.
+func (p *instancePlacementProvider) InstancesCount(ctx context.Context, projectName string, locationName string, includePending bool) (int, error) {
+	var count int
+
+	err := p.s.DB.Cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
+		var err error
+
+		count, err = tx.GetInstancesCount(ctx, projectName, locationName, includePending)
+
+		return err
+	})
+	if err != nil {
+		return -1, err
+	}
+
+	// Account for moves that have been decided but not completed yet.
+	if locationName != "" {
+		for _, pending := range instancePlacementPending(projectName) {
+			if pending.target == locationName {
+				count++
+			} else if pending.source == locationName {
+				count--
+			}
+		}
+	}
+
+	return count, nil
+}
+
+// ClusterMembers returns the cluster members available for placement, optionally limited to a group.
+func (p *instancePlacementProvider) ClusterMembers(ctx context.Context, group string) ([]*api.ClusterMember, error) {
+	var allMembers []db.NodeInfo
+
+	err := p.s.DB.Cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
+		var err error
+
+		allMembers, err = tx.GetNodes(ctx)
+		if err != nil {
+			return err
+		}
+
+		allMembers, err = tx.GetCandidateMembers(ctx, allMembers, nil, group, nil, p.s.GlobalConfig.OfflineThreshold())
+		if err != nil {
+			return err
+		}
+
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return p.membersToAPI(ctx, allMembers)
+}
+
+// Project returns the named project.
+func (p *instancePlacementProvider) Project(ctx context.Context, name string) (*api.Project, error) {
+	var apiProject *api.Project
+
+	err := p.s.DB.Cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
+		dbProject, err := dbCluster.GetProject(ctx, tx.Tx(), name)
+		if err != nil {
+			return err
+		}
+
+		apiProject, err = dbProject.ToAPI(ctx, tx.Tx())
+		if err != nil {
+			return err
+		}
+
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return apiProject, nil
+}
+
+// membersToAPI converts cluster member database records to their API representation.
+func (p *instancePlacementProvider) membersToAPI(ctx context.Context, members []db.NodeInfo) ([]*api.ClusterMember, error) {
 	var raftNodes []db.RaftNode
-	err = s.DB.Node.Transaction(ctx, func(ctx context.Context, tx *db.NodeTx) error {
+
+	err := p.s.DB.Node.Transaction(ctx, func(ctx context.Context, tx *db.NodeTx) error {
+		var err error
+
 		raftNodes, err = tx.GetRaftNodes(ctx)
 		if err != nil {
 			return fmt.Errorf("Failed loading RAFT nodes: %w", err)
@@ -502,8 +338,8 @@ func InstancePlacementRun(ctx context.Context, l logger.Logger, s *state.State, 
 		return nil, err
 	}
 
-	candidateMembersInfo := make([]*api.ClusterMember, 0, len(candidateMembers))
-	err = s.DB.Cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
+	membersInfo := make([]*api.ClusterMember, 0, len(members))
+	err = p.s.DB.Cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
 		failureDomains, err := tx.GetFailureDomainsNames(ctx)
 		if err != nil {
 			return fmt.Errorf("Failed loading failure domains names: %w", err)
@@ -520,21 +356,21 @@ func InstancePlacementRun(ctx context.Context, l logger.Logger, s *state.State, 
 		}
 
 		args := db.NodeInfoArgs{
-			LeaderAddress:        leaderAddress,
+			LeaderAddress:        p.leaderAddress,
 			FailureDomains:       failureDomains,
 			MemberFailureDomains: memberFailureDomains,
-			OfflineThreshold:     s.GlobalConfig.OfflineThreshold(),
+			OfflineThreshold:     p.s.GlobalConfig.OfflineThreshold(),
 			MaxMemberVersion:     maxVersion,
 			RaftNodes:            raftNodes,
 		}
 
-		for i := range candidateMembers {
-			candidateMemberInfo, err := db.APINodeInfo{NodeInfo: candidateMembers[i]}.ToAPI(ctx, tx, args)
+		for i := range members {
+			memberInfo, err := db.APINodeInfo{NodeInfo: members[i]}.ToAPI(ctx, tx, args)
 			if err != nil {
 				return err
 			}
 
-			candidateMembersInfo = append(candidateMembersInfo, candidateMemberInfo)
+			membersInfo = append(membersInfo, memberInfo)
 		}
 
 		return nil
@@ -543,71 +379,33 @@ func InstancePlacementRun(ctx context.Context, l logger.Logger, s *state.State, 
 		return nil, err
 	}
 
-	// Remember to match the entries in scriptletLoad.InstancePlacementCompile() with this list so Starlark can
-	// perform compile time validation of functions used.
-	env := starlark.StringDict{
-		"log_info":                     starlark.NewBuiltin("log_info", logFunc),
-		"log_warn":                     starlark.NewBuiltin("log_warn", logFunc),
-		"log_error":                    starlark.NewBuiltin("log_error", logFunc),
-		"set_target":                   starlark.NewBuiltin("set_target", setTargetFunc),
-		"get_cluster_member_resources": starlark.NewBuiltin("get_cluster_member_resources", getClusterMemberResourcesFunc),
-		"get_cluster_member_state":     starlark.NewBuiltin("get_cluster_member_state", getClusterMemberStateFunc),
-		"get_instance_resources":       starlark.NewBuiltin("get_instance_resources", getInstanceResourcesFunc),
-		"get_instances":                starlark.NewBuiltin("get_instances", getInstancesFunc),
-		"get_instances_count":          starlark.NewBuiltin("get_instances_count", getInstancesCountFunc),
-		"get_cluster_members":          starlark.NewBuiltin("get_cluster_members", getClusterMembersFunc),
-		"get_project":                  starlark.NewBuiltin("get_project", getProjectFunc),
+	return membersInfo, nil
+}
+
+// InstancePlacementRun runs the instance placement scriptlet and returns the chosen cluster member target.
+func InstancePlacementRun(ctx context.Context, l logger.Logger, s *state.State, req *apiScriptlet.InstancePlacement, candidateMembers []db.NodeInfo, leaderAddress string) (*db.NodeInfo, error) {
+	provider := &instancePlacementProvider{
+		s:                s,
+		candidateMembers: candidateMembers,
+		leaderAddress:    leaderAddress,
 	}
 
-	prog, thread, err := scriptletLoad.InstancePlacementProgram()
+	candidateMembersInfo, err := provider.membersToAPI(ctx, candidateMembers)
 	if err != nil {
 		return nil, err
 	}
 
-	go func() {
-		<-ctx.Done()
-		thread.Cancel("Request finished")
-	}()
-
-	globals, err := prog.Init(thread, env)
+	targetMemberName, err := placement.Run(ctx, l, req, candidateMembersInfo, provider)
 	if err != nil {
-		return nil, fmt.Errorf("Failed initializing: %w", err)
+		return nil, err
 	}
 
-	globals.Freeze()
-
-	// Retrieve a global variable from starlark environment.
-	instancePlacement := globals["instance_placement"]
-	if instancePlacement == nil {
-		return nil, errors.New("Scriptlet missing instance_placement function")
-	}
-
-	rv, err := scriptlet.StarlarkMarshal(req)
-	if err != nil {
-		return nil, fmt.Errorf("Marshalling request failed: %w", err)
-	}
-
-	candidateMembersv, err := scriptlet.StarlarkMarshal(candidateMembersInfo)
-	if err != nil {
-		return nil, fmt.Errorf("Marshalling candidate members failed: %w", err)
-	}
-
-	// Call starlark function from Go.
-	v, err := starlark.Call(thread, instancePlacement, nil, []starlark.Tuple{
-		{
-			starlark.String("request"),
-			rv,
-		}, {
-			starlark.String("candidate_members"),
-			candidateMembersv,
-		},
-	})
-	if err != nil {
-		return nil, fmt.Errorf("Failed to run: %w", err)
-	}
-
-	if v.Type() != "NoneType" {
-		return nil, fmt.Errorf("Failed with unexpected return value: %v", v)
+	var targetMember *db.NodeInfo
+	for i := range candidateMembers {
+		if candidateMembers[i].Name == targetMemberName {
+			targetMember = &candidateMembers[i]
+			break
+		}
 	}
 
 	return targetMember, nil
