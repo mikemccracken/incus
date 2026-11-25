@@ -142,6 +142,28 @@ func TestCommittedMemoryScriptlet(t *testing.T) {
 	require.Equal(t, outcomeRejected, res.Outcome)
 }
 
+func TestScenario(t *testing.T) {
+	sc, err := loadScenario("testdata/scenario.star")
+	require.NoError(t, err)
+	require.Equal(t, "spread.star", sc.Scriptlet)
+	require.Len(t, sc.Tests, 3)
+
+	// The scenario was written for the scriptlet it names.
+	reports, err := sc.run(context.Background(), "testdata/cluster.yaml", testScriptlet(t), "")
+	require.NoError(t, err)
+
+	for _, rep := range reports {
+		require.Empty(t, rep.Failure, rep.Name)
+	}
+
+	// The built-in placement doesn't keep the database instances apart.
+	reports, err = sc.run(context.Background(), "testdata/cluster.yaml", "", "")
+	require.NoError(t, err)
+	require.Equal(t, `scenario.star:25: got "builtin", want "scriptlet"`, reports[0].Failure)
+	require.Equal(t, `scenario.star:44: got "validated", want "rejected"`, reports[1].Failure)
+	require.Empty(t, reports[2].Failure)
+}
+
 func TestDocument(t *testing.T) {
 	sim := testSimulator(t, testScriptlet(t))
 

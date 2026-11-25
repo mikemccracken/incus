@@ -52,6 +52,10 @@ func main() {
 	runCmd := cmdRun{global: &globalCmd}
 	app.AddCommand(runCmd.command())
 
+	// test sub-command.
+	testCmd := cmdTest{global: &globalCmd}
+	app.AddCommand(testCmd.command())
+
 	// validate sub-command.
 	validateCmd := cmdValidate{global: &globalCmd}
 	app.AddCommand(validateCmd.command())
