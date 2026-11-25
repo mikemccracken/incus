@@ -44,6 +44,10 @@ func main() {
 	app.SetVersionTemplate("{{.Version}}\n")
 	app.Version = version.Version
 
+	// capture sub-command.
+	captureCmd := cmdCapture{global: &globalCmd}
+	app.AddCommand(captureCmd.command())
+
 	// validate sub-command.
 	validateCmd := cmdValidate{global: &globalCmd}
 	app.AddCommand(validateCmd.command())
